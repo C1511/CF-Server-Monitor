@@ -575,6 +575,7 @@ export function buildPublicView(env, state, { includeBilling = false } = {}) {
       currency: state.billing.currency,
       available_amount: state.billing.available_amount,
       month_pretax_amount: state.billing.month_pretax_amount,
+      month_outstanding_amount: state.billing.month_outstanding_amount,
       checked_at: state.billing.checked_at
     } : null
   };

@@ -76,16 +76,14 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { fetchAutomation } from '../utils/api.js'
+import { computed } from 'vue'
 import { useTranslation } from '../utils/i18n.js'
-
-const REFRESH_MS = 60_000
+import { useAutomation } from '../composables/useAutomation.js'
 
 const trans = useTranslation()
-const aliyun = ref(null)
-const signin = ref(null)
-let timer = null
+const { automation } = useAutomation()
+const aliyun = computed(() => automation.value?.aliyun || null)
+const signin = computed(() => automation.value?.signin || null)
 
 const hasAny = computed(() => Boolean(aliyun.value?.enabled || signin.value?.enabled))
 
@@ -143,24 +141,6 @@ const formatShortTime = (ts) => {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-const load = async () => {
-  try {
-    const data = await fetchAutomation()
-    aliyun.value = data?.aliyun || null
-    signin.value = data?.signin || null
-  } catch (_) {
-    // 面板为附加信息，加载失败时静默隐藏
-  }
-}
-
-onMounted(() => {
-  load()
-  timer = setInterval(load, REFRESH_MS)
-})
-
-onUnmounted(() => {
-  if (timer) clearInterval(timer)
-})
 </script>
 
 <style scoped>

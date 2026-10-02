@@ -137,8 +137,15 @@
           <span class="stat-net-up-color">↑ {{ formatBytes(stats.globalSpeedOut) }}/s</span>
         </div>
       </div>
+      <div v-if="aliyunOutstanding" class="stat-item">
+        <div class="stat-label">{{ trans.aliyunOutstanding }}</div>
+        <div class="stat-main-value stat-main-value-sm" :class="{ 'stat-offline-color': aliyunOutstanding.amount > 0 }">
+          {{ aliyunOutstanding.symbol }}{{ aliyunOutstanding.value }}
+          <span class="finance-currency-code">{{ aliyunOutstanding.currency }}</span>
+        </div>
+      </div>
       <div
-        v-if="sysConfig.show_price"
+        v-else-if="sysConfig.show_price"
         class="stat-item stat-action-item"
         @click="financeModalOpen = true"
       >
@@ -375,6 +382,7 @@ import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
 import AutomationPanel from '../components/AutomationPanel.vue'
+import { useAutomation } from '../composables/useAutomation.js'
 import { fetchConfig, fetchServersAll, fetchServersAllWithProgress, formatBytes, createLiveSocket, getFlagRegionCode, getApiBases, isServerOnline, normalizeLiveSocketTimeoutMinutes } from '../utils/api.js'
 import { calcTrafficUsagePercent, getUsageColor } from '../composables/useServerCardData'
 import { getTitle, hasMultipleApiBases, getPublicAssetUrl } from '../utils/config'
@@ -442,6 +450,21 @@ const router = useRouter()
 
 const trans = useTranslation()
 const financeRateCurrencies = DISPLAY_FINANCE_CURRENCIES
+
+// 阿里云未结清金额：账单数据只对已登录管理员返回，其他访客仍显示剩余价值
+const { automation } = useAutomation()
+const aliyunOutstanding = computed(() => {
+  const billing = automation.value?.aliyun?.billing
+  const amount = Number(billing?.month_outstanding_amount)
+  if (!billing || !Number.isFinite(amount)) return null
+  const currency = billing.currency || 'CNY'
+  return {
+    amount,
+    currency,
+    symbol: CURRENCY_SYMBOLS[currency] || '',
+    value: amount.toFixed(2)
+  }
+})
 const isMikusTheme = computed(() => isMikusThemeEnabled(sysConfig.value.theme_options))
 
 const mikusAsset = (filename) => getMikusAssetUrl(filename)
