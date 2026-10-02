@@ -167,7 +167,8 @@ function normalizeThemeUrl(value) {
       parts[2] !== 'tree' ||
       !/^[A-Za-z0-9._-]+$/.test(parts[0]) ||
       !/^[A-Za-z0-9._-]+$/.test(parts[1]) ||
-      !/^[A-Za-z0-9._-]+$/.test(ref) ||
+      // 仅允许固定到 commit SHA，避免主题作者后续推送的代码自动在本站同源执行
+      !/^[a-f0-9]{40}$/i.test(ref) ||
       parts.some(part => part === '.' || part === '..' || /[%\\]/.test(part))
     ) {
       return '';

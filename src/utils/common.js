@@ -46,7 +46,8 @@ export async function verifyTurnstileToken(token, secretKey) {
  * 管理后台密码哈希参数
  */
 export const PASSWORD_HASH_ALGORITHM = 'pbkdf2_sha256';
-export const PASSWORD_HASH_ITERATIONS = 50000;
+// Cloudflare Workers 的 PBKDF2 迭代次数上限为 100000
+export const PASSWORD_HASH_ITERATIONS = 100000;
 const PASSWORD_SALT_BYTES = 16;
 const PASSWORD_HASH_BYTES = 32;
 
@@ -151,9 +152,10 @@ export async function verifyPasswordHash(password, storedHash) {
   const parsed = parsePbkdf2Hash(storedHash);
   if (parsed) {
     const hash = await derivePbkdf2Hash(password, parsed.salt, parsed.iterations);
+    const valid = timingSafeEqualBytes(hash, parsed.hash);
     return {
-      valid: timingSafeEqualBytes(hash, parsed.hash),
-      needsRehash: false,
+      valid,
+      needsRehash: valid && parsed.iterations < PASSWORD_HASH_ITERATIONS,
       algorithm: PASSWORD_HASH_ALGORITHM
     };
   }

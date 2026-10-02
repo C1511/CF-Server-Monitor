@@ -2,6 +2,8 @@
 // node --check test/api-check.js
 // node test/api-check.js --help
 
+import { deriveAgentSecret } from '../src/utils/agentSecret.js';
+
 const DEFAULT_BASE_URL = 'http://localhost:8787';
 const MOCK_PUBLIC_SERVER_ID = '550e8400-e29b-41d4-a716-446655440001';
 const MOCK_HIDDEN_SERVER_ID = '550e8400-e29b-41d4-a716-446655440002';
@@ -146,8 +148,12 @@ async function bootstrap() {
   // 定义测试用例
   // ============================================================
 
+  const publicAgentSecret = await deriveAgentSecret(apiSecret, MOCK_PUBLIC_SERVER_ID);
+  const hiddenAgentSecret = await deriveAgentSecret(apiSecret, MOCK_HIDDEN_SERVER_ID);
+
   // 未登录测试用例
   const unauthenticatedCases = [
+    { name: 'POST /update 使用 API_SECRET 直接上报（已禁用）', method: 'POST', path: '/update', expectedStatus: 401, body: { id: MOCK_PUBLIC_SERVER_ID, secret: apiSecret, metrics: {} } },
     { name: 'GET /api/config', method: 'GET', path: '/api/config', expectedStatus: 200 },
     { name: 'GET /api/servers', method: 'GET', path: '/api/servers', expectedStatus: 200 },
     { name: 'GET /api/server 缺少 ID', method: 'GET', path: '/api/server', expectedStatus: 400 },
@@ -155,10 +161,10 @@ async function bootstrap() {
     { name: 'GET /api/ws', method: 'GET', path: '/api/ws', expectedStatus: 426, note: 'WebSocket 仅做 HTTP 探测' },
     { name: 'POST /updateDatabase', method: 'POST', path: '/updateDatabase', expectedStatus: 401 },
     { name: 'POST /clearHistory', method: 'POST', path: '/clearHistory', expectedStatus: 401 },
-    { name: 'GET /__do/health', method: 'GET', path: '/__do/health', expectedStatus: 200 },
+    { name: 'GET /__do/health（未登录）', method: 'GET', path: '/__do/health', expectedStatus: 401 },
     { name: 'POST /update 无效 secret', method: 'POST', path: '/update', expectedStatus: 401, body: { id: MOCK_PUBLIC_SERVER_ID, secret: '__invalid__', metrics: {} } },
-    { name: 'POST /update 公开服务器上报成功', method: 'POST', path: '/update', expectedStatus: 200, body: { id: MOCK_PUBLIC_SERVER_ID, secret: apiSecret, metrics: buildMockMetrics() }, headers: { 'X-Agent-Version': AGENT_VERSION } },
-    { name: 'POST /update 隐藏服务器上报成功', method: 'POST', path: '/update', expectedStatus: 200, body: { id: MOCK_HIDDEN_SERVER_ID, secret: apiSecret, metrics: buildMockMetrics() }, headers: { 'X-Agent-Version': AGENT_VERSION } },
+    { name: 'POST /update 公开服务器上报成功', method: 'POST', path: '/update', expectedStatus: 200, body: { id: MOCK_PUBLIC_SERVER_ID, secret: publicAgentSecret, metrics: buildMockMetrics() }, headers: { 'X-Agent-Version': AGENT_VERSION } },
+    { name: 'POST /update 隐藏服务器上报成功', method: 'POST', path: '/update', expectedStatus: 200, body: { id: MOCK_HIDDEN_SERVER_ID, secret: hiddenAgentSecret, metrics: buildMockMetrics() }, headers: { 'X-Agent-Version': AGENT_VERSION } },
     { name: 'GET /api/server 公开服务器（未登录）', method: 'GET', path: `/api/server?id=${encodeURIComponent(MOCK_PUBLIC_SERVER_ID)}`, expectedStatus: 200 },
     { name: 'GET /api/server 隐藏服务器（未登录）', method: 'GET', path: `/api/server?id=${encodeURIComponent(MOCK_HIDDEN_SERVER_ID)}`, expectedStatus: 404 },
     { name: 'GET 不存在路径', method: 'GET', path: '/__api_check_not_found__', expectedStatus: 200, note: 'Worker 未命中 API 路由时会回退前端' }

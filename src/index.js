@@ -281,6 +281,10 @@ export default {
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {
+        await ensureSiteSettings();
+        if (!await checkAuth(request, env, sys)) {
+          return simpleAuthResponse();
+        }
         if (!env.METRICS_BROADCASTER) {
           return createSuccessResponse({ ok: false, reason: 'DO not bound' });
         }
@@ -464,23 +468,7 @@ export default {
           return response;
         }
 
-        if (setTurnstileVerified) {
-          const expires = Math.floor(Date.now() / 1000) + 3600;
-          const cookieData = { expires, verified: true, timestamp: Date.now() };
-          const encryptedData = await encryptTurnstileData(cookieData, env, sys);
-
-          const finalHeaders = new Headers(response.headers);
-          finalHeaders.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '');
-          finalHeaders.set('Access-Control-Allow-Credentials', 'true');
-          finalHeaders.set('Vary', 'Origin');
-
-          return new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: finalHeaders
-          });
-        }
-
+        // Turnstile 验证通过后同样只对白名单 Origin 返回 CORS 头，不再反射任意 Origin
         return applyCors(response, request, corsAllowedOrigins);
       }
     }

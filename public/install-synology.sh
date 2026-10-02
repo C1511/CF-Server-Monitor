@@ -352,8 +352,8 @@ get_install_url() {
     url="${WORKER_URL%%\?*}"
     case "$url" in
         http://*)
-            rest="${url#http://}"
-            origin="http://${rest%%/*}"
+            # 自动更新会以 root 执行下载的脚本，禁止通过明文 HTTP 获取
+            return 1
             ;;
         https://*)
             rest="${url#https://}"
@@ -587,9 +587,9 @@ send_correction_confirm() {
     tx_val=$(normalize_correction_value "$2")
     is_valid_correction_value "$rx_val" && is_valid_correction_value "$tx_val" || return 1
     payload="{\"id\":\"$SERVER_ID\",\"secret\":\"$SECRET\",\"rx_correction\":$rx_val,\"tx_correction\":$tx_val}"
-    http_code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+    http_code=$(printf '%s' "$payload" | curl -sS -o /dev/null -w "%{http_code}" -X POST \
         -H "Content-Type: application/json" \
-        -d "$payload" -m 4 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo 000)
+        --data-binary @- -m 4 --connect-timeout 2 "$WORKER_URL" 2>/dev/null || echo 000)
     case "$http_code" in ''|*[!0-9]*) http_code=000 ;; esac
     if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
         log_info "Traffic correction confirm sent: RX=${rx_val}GB TX=${tx_val}GB"
@@ -1432,12 +1432,12 @@ EOF
         REPORT_HEADER_FILE="/dev/shm/.cf_probe_headers.$$"
         REPORT_ERROR_FILE="/dev/shm/.cf_probe_error.$$"
         REPORT_HEADERS=""
-        REPORT_HTTP_CODE=$(curl -sS -D "$REPORT_HEADER_FILE" -o "$REPORT_RESPONSE_FILE" -w "%{http_code}" -X POST \
+        REPORT_HTTP_CODE=$(printf '%s' "$PAYLOAD" | curl -sS -D "$REPORT_HEADER_FILE" -o "$REPORT_RESPONSE_FILE" -w "%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "X-Agent-Config-Schema: 3" \
             -H "X-Agent-Version: ${AGENT_VERSION}" \
             -H "X-Agent-Config-Md5: ${CONFIG_MD5:-none}" \
-            -d "$PAYLOAD" -m 8 --connect-timeout 3 "$WORKER_URL" 2>"$REPORT_ERROR_FILE")
+            --data-binary @- -m 8 --connect-timeout 3 "$WORKER_URL" 2>"$REPORT_ERROR_FILE")
         REPORT_CURL_EXIT=$?
         case "$REPORT_HTTP_CODE" in ''|*[!0-9]*) REPORT_HTTP_CODE=000 ;; esac
         REPORT_RESPONSE=$(head -c 300 "$REPORT_RESPONSE_FILE" 2>/dev/null | tr '\r\n' '  ')

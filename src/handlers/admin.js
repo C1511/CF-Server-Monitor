@@ -1,7 +1,7 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, isValidJwtSecret, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
@@ -11,6 +11,8 @@ import { clearResourceAlertState, isSmtpNotificationTarget, sendNotification } f
 import { getNextServerHistoryPartitionId, HISTORY_MAX_PARTITION_ID } from '../database/indexOptimization.js';
 import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, normalizeWssReportInterval, validateAgentConfigInput, validatePingNode, validateNetworkInterfaces } from '../utils/agentConfig.js';
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
+import { deriveAgentSecret } from '../utils/agentSecret.js';
+import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
 
@@ -184,7 +186,8 @@ function normalizeThemeUrl(value) {
       parts[2] !== 'tree' ||
       !/^[A-Za-z0-9._-]+$/.test(parts[0]) ||
       !/^[A-Za-z0-9._-]+$/.test(parts[1]) ||
-      !/^[A-Za-z0-9._-]+$/.test(ref) ||
+      // 仅允许固定到 commit SHA，避免主题作者后续推送的代码自动在本站同源执行
+      !/^[a-f0-9]{40}$/i.test(ref) ||
       parts.some(part => part === '.' || part === '..' || /[%\\]/.test(part))
     ) {
       return null;
@@ -468,6 +471,11 @@ async function handleLoginAction({ request, env, sys, data }) {
     return createBadRequestResponse('missingCredentials');
   }
 
+  const clientIp = getClientIp(request);
+  if (await isLoginBlocked(env.DB, clientIp)) {
+    return createErrorResponse(new AppError('tooManyLoginAttempts', 429));
+  }
+
   const turnstileEnabled = sys && (sys.turnstile_enabled === 'true' || sys.turnstile_enabled === true);
   const turnstileLoginEnabled = sys && (sys.turnstile_login_enabled === 'true' || sys.turnstile_login_enabled === true);
   const turnstileSecretKey = sys && sys.turnstile_secret_key || '';
@@ -491,8 +499,11 @@ async function handleLoginAction({ request, env, sys, data }) {
   const credentialResult = await validateCredentials(mockRequest, env, sys);
 
   if (!credentialResult.valid) {
+    await recordLoginFailure(env.DB, clientIp);
     return createUnauthorizedResponse('invalidCredentials');
   }
+
+  await clearLoginFailures(env.DB, clientIp);
 
   if (credentialResult.needsPasswordUpgrade) {
     try {
@@ -556,8 +567,7 @@ async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
   const fullSettings = loadFullSettings ? await loadFullSettings() : sys;
   return createSuccessResponse({
     success: true,
-    settings: sanitizeAdminSettings(fullSettings),
-    api_secret: env.API_SECRET
+    settings: sanitizeAdminSettings(fullSettings)
   });
 }
 
@@ -657,6 +667,10 @@ async function handleListAction({ env }) {
   if (stats.online > 0) {
     stats.avg_cpu = (stats.total_cpu / stats.online).toFixed(2);
   }
+
+  await Promise.all(serversWithStatus.map(async item => {
+    item.agent_secret = await deriveAgentSecret(env.API_SECRET, item.id);
+  }));
 
   return createSuccessResponse({
     success: true,
@@ -894,6 +908,9 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         if (settings[field] !== undefined) {
           if (field === 'password') {
             if (settings[field] && settings[field].length > 0) {
+              if (settings[field] === env.API_SECRET) {
+                return createBadRequestResponse('passwordSameAsApiSecret');
+              }
               siteOptions[field] = await hashPassword(settings[field]);
             }
           } else if (PING_NODE_FIELDS.includes(field)) {
@@ -945,6 +962,13 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
           }
         }
       }
+      // 修改密码时轮换 JWT 密钥，使所有旧会话（包括可能泄露的 token）立即失效
+      const passwordChanged = Boolean(siteOptions.password);
+      if (passwordChanged && !isValidJwtSecret(siteOptions.jwt_secret)) {
+        const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+        siteOptions.jwt_secret = Array.from(randomBytes, b => b.toString(16).padStart(2, '0')).join('');
+      }
+      const jwtSecretChanged = isValidJwtSecret(siteOptions.jwt_secret) && siteOptions.jwt_secret !== sys?.jwt_secret;
       await saveSiteOptions(env.DB, siteOptions);
       // 保存设置后非致命补列：确保 servers 表的告警相关列存在，避免启用月流量阈值后
       // 告警状态因缺列无法持久化而重复发送通知。设置已保存成功，补列失败不回滚、不报错。
@@ -965,6 +989,15 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         settings.wss_report_hours !== undefined
       )) {
         scheduleAgentReportModeChanged(env, ctx);
+      }
+      if (jwtSecretChanged) {
+        // 旧 token 已失效，为当前管理员签发新 token，避免保存后被登出
+        const token = await generateToken(env, sys);
+        return createSuccessResponseWithCookies({
+          success: true,
+          token,
+          message: 'updateSuccess'
+        }, [buildAuthCookie(request, token)]);
       }
       return createSuccessResponse({
         success: true,

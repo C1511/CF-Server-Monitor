@@ -3,9 +3,8 @@ name: Upstream Sync
 permissions:
   contents: write
 
+# 已关闭每日自动同步：上游的任何改动都应先人工审查，再手动触发同步
 on:
-  schedule:
-    - cron: "0 0 * * *" # every day
   workflow_dispatch:
 
 jobs:

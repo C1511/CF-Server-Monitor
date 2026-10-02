@@ -16,6 +16,7 @@ import {
   markFrontendRealtimeActive
 } from '../utils/realtimeBroadcastGate.js';
 import { checkWebSocketAuth } from '../middleware/auth.js';
+import { verifyAgentSecret } from '../utils/agentSecret.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_SCHEMA_HEADER,
@@ -509,7 +510,7 @@ export async function handleUpdate(request, env, ctx) {
     const data = await request.json();
     const { id, secret } = data;
 
-    if (secret !== env.API_SECRET) {
+    if (!await verifyAgentSecret(env, id, secret)) {
       return createUnauthorizedResponse('Invalid secret');
     }
 

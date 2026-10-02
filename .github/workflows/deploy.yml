@@ -42,12 +42,16 @@ jobs:
           node-version: '22'
 
       - name: 📦 Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: 🏗️ Build frontend assets
         run: npm run build:frontend
 
       - name: 📝 Create wrangler.toml
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          API_USER_NAME: ${{ secrets.API_USER_NAME }}
+          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
         run: |
           cat > wrangler.toml << 'WEOF'
           name = "server-monitor-pro"
@@ -65,11 +69,6 @@ jobs:
           directory = "./dist"
           binding = "ASSETS"
 
-          [[d1_databases]]
-          binding = "DB"
-          database_name = "server-monitor-db"
-          database_id = "D1_PLACEHOLDER"
-
           # Durable Objects：实时指标广播中心
           [[durable_objects.bindings]]
           name = "METRICS_BROADCASTER"
@@ -78,18 +77,27 @@ jobs:
           [[migrations]]
           tag = "v1"
           new_sqlite_classes = ["MetricsBroadcaster"]
-
-          [vars]
-          API_SECRET = "SECRET_PLACEHOLDER"
-          API_USER_NAME = "USER_NAME_PLACEHOLDER"
-          CORS_ALLOWED_ORIGINS = "CORS_ORIGINS_PLACEHOLDER"
           WEOF
 
-          # 替换占位符
-          sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
-          sed -i "s|SECRET_PLACEHOLDER|${{ secrets.API_SECRET }}|g" wrangler.toml
-          sed -i "s|USER_NAME_PLACEHOLDER|${{ secrets.API_USER_NAME }}|g" wrangler.toml
-          sed -i "s|CORS_ORIGINS_PLACEHOLDER|${{ secrets.CORS_ALLOWED_ORIGINS }}|g" wrangler.toml
+          # 通过环境变量 + JSON 转义写入，避免值中的特殊字符破坏 TOML 或被 shell 解释
+          # API_SECRET 不写入 [vars]（明文、控制台可见），而是在部署后作为加密 Secret 上传
+          node -e '
+            const fs = require("fs");
+            const q = v => JSON.stringify(String(v || ""));
+            const e = process.env;
+            fs.appendFileSync("wrangler.toml", [
+              "",
+              "[[d1_databases]]",
+              "binding = \"DB\"",
+              "database_name = \"server-monitor-db\"",
+              "database_id = " + q(e.D1_DATABASE_ID),
+              "",
+              "[vars]",
+              "API_USER_NAME = " + q(e.API_USER_NAME),
+              "CORS_ALLOWED_ORIGINS = " + q(e.CORS_ALLOWED_ORIGINS),
+              ""
+            ].join(String.fromCharCode(10)));
+          '
 
           echo "✅ wrangler.toml 已生成"
 
@@ -103,6 +111,19 @@ jobs:
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           wranglerVersion: '4'
           command: deploy
+
+      # API_SECRET 作为加密 Secret 上传（通过 stdin 传入，不出现在命令行和日志中）
+      - name: 🔐 Upload API_SECRET as Worker secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+        run: |
+          if [ -z "$API_SECRET" ]; then
+            echo "API_SECRET 未配置" >&2
+            exit 1
+          fi
+          printf '%s' "$API_SECRET" | npx wrangler secret put API_SECRET
 
       - name: ✅ Deployment Success
         if: success()

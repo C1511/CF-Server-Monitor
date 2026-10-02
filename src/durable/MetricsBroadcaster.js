@@ -17,6 +17,7 @@ import { evaluateTrafficAlert } from '../services/notification.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getServerDetail, clearServerDetailCache } from '../utils/cache.js';
 import { getWssReportScheduleState, loadSiteSettings } from '../utils/settings.js';
+import { verifyAgentSecret } from '../utils/agentSecret.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
@@ -698,7 +699,7 @@ export class MetricsBroadcaster {
 
     const hasSecret = Object.prototype.hasOwnProperty.call(data, 'secret');
     if (!attachment.authenticated || hasSecret) {
-      if (data.secret !== this.env.API_SECRET) {
+      if (!await verifyAgentSecret(this.env, serverId, data.secret)) {
         this._closeWsWithError(ws, 'Invalid secret', 401);
         return null;
       }

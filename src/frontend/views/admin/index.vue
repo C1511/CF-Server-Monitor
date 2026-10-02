@@ -985,7 +985,6 @@ const settings = ref({
   csp_static: '',
   csp_api: ''
 })
-const apiSecret = ref('')
 const changeAdminPassword = ref(false)
 
 const clearAdminPasswordInputs = () => {
@@ -1500,7 +1499,6 @@ const loadSettings = async () => {
       }
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
-      apiSecret.value = data.api_secret || ''
     }
   } catch (e) {
     console.error('[ERROR] Load settings failed:', e)
@@ -1721,6 +1719,9 @@ const saveSettings = async () => {
   try {
     const result = await adminApiForSite(data)
     if (!result.error) {
+      if (result.data?.token) {
+        localStorage.setItem('jwt_token', result.data.token)
+      }
       saveResult.value = { success: true }
       applyMikusThemeOptions(themeOptionsResult.value)
       clearAdminPasswordInputs()
@@ -1805,9 +1806,15 @@ const addServer = async () => {
   }
 }
 
+// 每台服务器使用独立派生的上报密钥（由后端 list 接口返回）
+const getAgentSecret = (serverId) => {
+  const server = servers.value.find(item => item.id === serverId)
+  return server?.agent_secret || ''
+}
+
 const getInstallCommand = (serverId) => {
   const HOST = selectedApiBase.value
-  return `curl -sL ${HOST}/install.sh | bash -s install -id=${serverId} -secret='${apiSecret.value}' -url=${HOST}/update`
+  return `curl -sL ${HOST}/install.sh | bash -s install -id=${serverId} -secret='${getAgentSecret(serverId)}' -url=${HOST}/update`
 }
 
 const resolveServerPingNode = (server, field) => {
@@ -1974,7 +1981,7 @@ const getCustomInstallCommand = () => {
     if (version) params.push(quotePowerShellArg(`--install-version=${version}`))
     params.push(
       `-id='${copyServerId.value}'`,
-      `-secret='${apiSecret.value}'`,
+      `-secret='${getAgentSecret(copyServerId.value)}'`,
       `-url='${HOST}/update'`,
       `-collect_interval='${collectInterval.value}'`,
       `-interval='${reportInterval.value}'`,
@@ -2000,7 +2007,7 @@ const getCustomInstallCommand = () => {
     return [
       'docker run -d --name cf-probe --restart=unless-stopped --network=host \\',
       '  -v cf-probe-data:/data \\',
-      `  -e SERVER_ID=${quotePosixShellArg(copyServerId.value)} -e SECRET=${quotePosixShellArg(apiSecret.value)} -e WORKER_URL=${quotePosixShellArg(`${HOST}/update`)} \\`,
+      `  -e SERVER_ID=${quotePosixShellArg(copyServerId.value)} -e SECRET=${quotePosixShellArg(getAgentSecret(copyServerId.value))} -e WORKER_URL=${quotePosixShellArg(`${HOST}/update`)} \\`,
       `  ${image}`
     ].join('\n')
   }
@@ -2009,7 +2016,7 @@ const getCustomInstallCommand = () => {
   if (version) params.push(quotePosixShellArg(`--install-version=${version}`))
   params.push(
     `-id=${copyServerId.value}`,
-    `-secret='${apiSecret.value}'`,
+    `-secret='${getAgentSecret(copyServerId.value)}'`,
     `-url=${HOST}/update`,
     `-collect_interval=${collectInterval.value}`,
     `-interval=${reportInterval.value}`,
