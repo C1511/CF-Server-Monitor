@@ -13,7 +13,7 @@ import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, n
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
 import { deriveAgentSecret } from '../utils/agentSecret.js';
 import { buildAdminView, loadKeepaliveState, resolveAliyunConfig, runAliyunKeepalive, setAliyunKeepalivePaused, setAliyunThreshold } from '../services/aliyunKeepalive.js';
-import { buildSigninAdminView, loadSigninState, runNodeseekSignin } from '../services/nodeseekSignin.js';
+import { buildSigninAdminView, loadSigninState, resolveSigninConfig, runNodeseekSignin, setSigninCookie } from '../services/nodeseekSignin.js';
 import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
@@ -788,24 +788,42 @@ async function handleAliyunSetThresholdAction({ env, data }) {
   }
 }
 
+async function signinAdminResponse(env, state) {
+  const config = await resolveSigninConfig(env);
+  // 未配置时 runNodeseekSignin 返回 { enabled: false }，此时仍展示已保存的历史
+  const effectiveState = state?.enabled === false ? await loadSigninState(env.DB) : state;
+  return createSuccessResponse({ success: true, ...buildSigninAdminView(config, effectiveState) });
+}
+
 async function handleSigninStatusAction({ env }) {
-  return createSuccessResponse({ success: true, ...buildSigninAdminView(env, await loadSigninState(env.DB)) });
+  return signinAdminResponse(env, await loadSigninState(env.DB));
 }
 
 async function handleSigninCheckAction({ env }) {
-  const state = await runNodeseekSignin(env, { dryRun: true, trigger: 'manual' });
-  return createSuccessResponse({ success: true, ...buildSigninAdminView(env, state.enabled === false ? null : state) });
+  return signinAdminResponse(env, await runNodeseekSignin(env, { dryRun: true, trigger: 'manual' }));
 }
 
 async function handleSigninRunAction({ env }) {
-  const state = await runNodeseekSignin(env, { trigger: 'manual' });
-  return createSuccessResponse({ success: true, ...buildSigninAdminView(env, state.enabled === false ? null : state) });
+  return signinAdminResponse(env, await runNodeseekSignin(env, { trigger: 'manual' }));
+}
+
+// Cookie 只写不读：响应中不会返回 Cookie 内容
+async function handleSigninSetCookieAction({ env, data }) {
+  try {
+    return signinAdminResponse(env, await setSigninCookie(env, data.cookie));
+  } catch (e) {
+    if (e?.message === 'invalidCookie') {
+      return createBadRequestResponse('invalidCookie');
+    }
+    throw e;
+  }
 }
 
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   signin_status: handleSigninStatusAction,
   signin_check: handleSigninCheckAction,
   signin_run: handleSigninRunAction,
+  signin_set_cookie: handleSigninSetCookieAction,
   aliyun_status: handleAliyunStatusAction,
   aliyun_refresh: handleAliyunRefreshAction,
   aliyun_run: handleAliyunRunAction,

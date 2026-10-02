@@ -150,8 +150,11 @@
           <button class="btn btn-primary" :disabled="signinBusy" @click="signinAction('signin_run')">✔ {{ trans.signinRunNow }}</button>
         </div>
 
-        <div v-if="signin.login_invalid" class="danger-box mb-2">{{ trans.signinCookieInvalid }}</div>
-        <div v-else-if="signin.error" class="danger-box mb-2">{{ trans.errorLabel }}：{{ signin.error }}</div>
+        <div v-if="signin.error" class="danger-box mb-2">
+          <div v-if="signin.failure_kind === 'cookie_invalid'"><b>{{ trans.signinCookieInvalid }}</b></div>
+          <div v-else-if="signin.failure_kind === 'blocked'"><b>{{ trans.signinBlocked }}</b></div>
+          <div class="text-sm">{{ trans.errorLabel }}：{{ signin.error }}</div>
+        </div>
 
         <div class="automation-kv">
           <div><span>{{ trans.signinToday }}</span><b>{{ signinStatusText(signin.today.status) }}{{ signin.detail?.message ? ' · ' + signin.detail.message : '' }}</b></div>
@@ -174,6 +177,34 @@
             </tr>
           </tbody>
         </table>
+      </template>
+
+      <template v-if="signinLoaded && signin?.config">
+        <div class="automation-subtitle">{{ trans.signinCookieTitle }}</div>
+        <div v-if="signin.config.stored_cookie_unreadable" class="warning-box mb-2">{{ trans.signinCookieUnreadable }}</div>
+        <div class="automation-kv mb-2">
+          <div>
+            <span>{{ trans.signinCookieSource }}</span>
+            <b>{{ cookieSourceText }}<template v-if="signin.config.cookie_source === 'admin' && signin.config.cookie_updated_at"> · {{ formatDateTime(signin.config.cookie_updated_at) }}</template></b>
+          </div>
+        </div>
+        <textarea
+          v-model="cookieInput"
+          class="form-input cookie-input"
+          rows="3"
+          autocomplete="off"
+          spellcheck="false"
+          data-lpignore="true"
+          data-1p-ignore="true"
+          :placeholder="trans.signinCookiePlaceholder"
+          :aria-label="trans.signinCookieTitle"
+        ></textarea>
+        <div class="automation-actions cookie-actions">
+          <button class="btn btn-primary" :disabled="signinBusy || !cookieInput.trim()" @click="saveCookie">{{ trans.signinCookieSave }}</button>
+          <button class="btn" :disabled="signinBusy || signin.config.cookie_source !== 'admin'" @click="clearCookie">{{ trans.signinCookieClear }}</button>
+          <span v-if="cookieSaved" class="text-green text-sm">✓ {{ trans.signinCookieSaved }}</span>
+        </div>
+        <p class="text-muted text-sm">{{ trans.signinCookieHint }}</p>
       </template>
     </div>
   </div>
@@ -270,6 +301,32 @@ const runKeepalive = () => {
   }
 }
 
+const cookieInput = ref('')
+const cookieSaved = ref(false)
+
+const cookieSourceText = computed(() => {
+  const source = signin.value?.config?.cookie_source
+  if (source === 'admin') return props.trans.cookieSourceAdmin
+  if (source === 'env') return props.trans.cookieSourceEnv
+  return props.trans.cookieSourceNone
+})
+
+const saveCookie = async () => {
+  // 允许直接粘贴带 "Cookie:" 前缀的整行
+  const value = cookieInput.value.trim().replace(/^cookie:\s*/i, '')
+  if (!value) return
+  cookieSaved.value = false
+  if (await signinAction('signin_set_cookie', { cookie: value })) {
+    cookieInput.value = ''
+    cookieSaved.value = true
+  }
+}
+
+const clearCookie = () => {
+  cookieSaved.value = false
+  signinAction('signin_set_cookie', { cookie: '' })
+}
+
 const saveThreshold = () => {
   if (!thresholdChanged.value) return
   aliyunAction('aliyun_set_threshold', { threshold_gb: Number(thresholdInput.value) })
@@ -279,11 +336,12 @@ const resetThreshold = () => {
   aliyunAction('aliyun_set_threshold', { threshold_gb: null })
 }
 
-const signinAction = async (action) => {
+const signinAction = async (action, extra = {}) => {
   signinBusy.value = true
   try {
-    const data = await call({ action })
+    const data = await call({ action, ...extra })
     if (data) signin.value = data
+    return Boolean(data)
   } finally {
     signinBusy.value = false
     signinLoaded.value = true
@@ -353,6 +411,19 @@ watch(() => props.activeTab, (tab) => {
 .automation-table th {
   color: var(--text-secondary);
   font-weight: 500;
+}
+
+.cookie-input {
+  width: 100%;
+  min-height: 72px;
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.cookie-actions {
+  margin-top: 8px;
+  align-items: center;
 }
 
 .threshold-editor {

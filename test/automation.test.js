@@ -17,9 +17,12 @@ import {
 } from '../src/services/aliyunKeepalive.js';
 import {
   beijingDate,
+  buildSigninAdminView,
   buildSigninPublicView,
+  resolveSigninConfig,
   runNodeseekSignin,
-  runNodeseekSigninIfDue
+  runNodeseekSigninIfDue,
+  setSigninCookie
 } from '../src/services/nodeseekSignin.js';
 
 const GB = 1024 ** 3;
@@ -330,82 +333,143 @@ test('public view includes billing only for logged-in admins', async () => {
 const AFTER_SCHEDULE = Date.UTC(2026, 9, 2, 0, 40);
 const BEFORE_SCHEDULE = Date.UTC(2026, 9, 2, 0, 20);
 
-function nsHandler({ signed = false, attendance = { success: true, message: '获得鸡腿 7 个', gain: 7, current: 120 }, boardStatus = 200 } = {}) {
+const CHALLENGE_HTML = '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script></body></html>';
+const LOGIN_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>登录 - NodeSeek</title></head><body></body></html>';
+const SPA_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>NodeSeek</title></head><body></body></html>';
+
+function nsHandler({
+  signed = false,
+  attendance = { success: true, message: '获得鸡腿 7 个', gain: 7, current: 120 },
+  attendanceHtml = null,
+  attendanceStatus = 200
+} = {}) {
   return (u, init) => {
     if (u.pathname === '/api/attendance/board') {
-      if (boardStatus !== 200) return new Response('<html>login</html>', { status: boardStatus });
       return Response.json({ success: true, record: signed ? { gain: 5, rank: 12 } : null, memberList: [] });
     }
     if (u.pathname === '/api/attendance' && init.method === 'POST') {
-      return Response.json(attendance);
+      if (attendanceHtml) return new Response(attendanceHtml, { status: attendanceStatus, headers: { 'Content-Type': 'text/html' } });
+      return Response.json(attendance, { status: attendanceStatus });
     }
     return new Response('not found', { status: 404 });
   };
 }
 
-test('signin posts once when not yet signed and records gain', async () => {
-  const env = { DB: createD1(), NS_COOKIE: 'session=abc' };
+test('signin posts directly and records gain; the board is not needed for a real run', async () => {
+  const env = { DB: createD1(), NS_COOKIE: 'session=abc', API_SECRET: 's' };
   const f = mockFetch(nsHandler());
   try {
     const state = await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
+    assert.equal(f.calls.some(c => c.url.pathname === '/api/attendance/board'), false);
     const post = f.calls.find(c => c.init.method === 'POST');
-    assert.ok(post);
     assert.equal(post.url.searchParams.get('random'), 'true');
     assert.equal(post.init.headers.Cookie, 'session=abc');
-    assert.equal(state.today.status, 'success');
-    assert.equal(state.today.gain, 7);
-    assert.equal(state.today.current, 120);
+    assert.deepEqual([state.today.status, state.today.gain, state.today.current], ['success', 7, 120]);
+    assert.equal(state.failure_kind, '');
   } finally {
     f.restore();
   }
 });
 
-test('signin skips the POST when the board shows today is already signed, and dry run never posts', async () => {
-  const env = { DB: createD1(), NS_COOKIE: 'session=abc' };
-  let f = mockFetch(nsHandler({ signed: true }));
+test('already-signed reply counts as done; dry run only reads the board', async () => {
+  let f = mockFetch(nsHandler({ attendance: { success: false, message: '今天已完成签到，请勿重复操作' } }));
   try {
-    const state = await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
+    const state = await runNodeseekSignin({ DB: createD1(), NS_COOKIE: 'c', API_SECRET: 's' }, { now: AFTER_SCHEDULE });
+    assert.equal(state.today.status, 'already');
+    assert.equal(state.history[0].status, 'already');
+  } finally {
+    f.restore();
+  }
+
+  f = mockFetch(nsHandler({ signed: true }));
+  try {
+    const state = await runNodeseekSignin({ DB: createD1(), NS_COOKIE: 'c', API_SECRET: 's' }, { dryRun: true, now: AFTER_SCHEDULE });
     assert.equal(f.calls.some(c => c.init.method === 'POST'), false);
     assert.equal(state.today.status, 'already');
-    assert.equal(state.today.gain, 5);
-  } finally {
-    f.restore();
-  }
-
-  const env2 = { DB: createD1(), NS_COOKIE: 'session=abc' };
-  f = mockFetch(nsHandler());
-  try {
-    const state = await runNodeseekSignin(env2, { dryRun: true, now: AFTER_SCHEDULE });
-    assert.equal(f.calls.some(c => c.init.method === 'POST'), false);
-    assert.equal(state.today.status, 'pending');
+    assert.equal(state.attempts.count, 0, 'dry run does not use up attempts');
   } finally {
     f.restore();
   }
 });
 
-test('signin reports an expired cookie and risk-control failures', async () => {
-  const env = { DB: createD1(), NS_COOKIE: 'session=old' };
-  let f = mockFetch(nsHandler({ boardStatus: 403 }));
+test('failures are classified: expired cookie vs blocked vs HTML page with its title', async () => {
+  const cases = [
+    [{ attendance: { success: false, status: 404, message: 'USER NOT FOUND' }, attendanceStatus: 500 }, 'cookie_invalid', /USER NOT FOUND/],
+    [{ attendanceHtml: LOGIN_HTML }, 'cookie_invalid', /登录 - NodeSeek/],
+    [{ attendanceHtml: CHALLENGE_HTML, attendanceStatus: 403 }, 'blocked', /人机验证页 「Just a moment\.\.\.」/],
+    [{ attendanceHtml: SPA_HTML }, 'blocked', /「NodeSeek」 \(HTTP 200\)/],
+    [{ attendance: { success: false, message: 'high risk action' } }, 'blocked', /high risk action/],
+    [{ attendance: { success: false, message: 'something else' } }, 'error', /something else/]
+  ];
+  for (const [handlerOptions, kind, pattern] of cases) {
+    const f = mockFetch(nsHandler(handlerOptions));
+    try {
+      const state = await runNodeseekSignin({ DB: createD1(), NS_COOKIE: 'c', API_SECRET: 's' }, { now: AFTER_SCHEDULE });
+      assert.equal(state.today.status, 'failed', kind);
+      assert.equal(state.failure_kind, kind, String(pattern));
+      assert.equal(state.login_invalid, kind === 'cookie_invalid');
+      assert.match(state.error, pattern);
+    } finally {
+      f.restore();
+    }
+  }
+});
+
+test('cookie set in admin is encrypted at rest, overrides NS_COOKIE and resets today\'s attempts', async () => {
+  const db = createD1();
+  const env = { DB: db, NS_COOKIE: 'env-cookie=1', API_SECRET: 'secret-A' };
+
+  let f = mockFetch(nsHandler({ attendance: { success: false, message: 'USER NOT FOUND' } }));
   try {
-    const state = await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
-    assert.equal(state.today.status, 'failed');
-    assert.match(state.error, /登录可能已失效|风控/);
+    for (let i = 0; i < 3; i++) await runNodeseekSignin(env, { now: AFTER_SCHEDULE + i * 31 * 60000 });
+    assert.equal(await runNodeseekSigninIfDue(env, AFTER_SCHEDULE + 4 * 31 * 60000), null, 'retries exhausted');
   } finally {
     f.restore();
   }
 
-  f = mockFetch(nsHandler({ attendance: { success: false, message: 'high risk action' } }));
+  const state = await setSigninCookie(env, ' admin-cookie=xyz; other=1 ', AFTER_SCHEDULE + 130 * 60000);
+  assert.equal(state.login_invalid, false);
+  assert.equal(state.attempts.count, 0);
+
+  const raw = (await db.prepare("SELECT value FROM settings WHERE key = 'nodeseek_signin_cookie'").first()).value;
+  assert.equal(raw.includes('admin-cookie'), false, 'not stored in plaintext');
+
+  const config = await resolveSigninConfig(env);
+  assert.deepEqual([config.cookie, config.cookieSource], ['admin-cookie=xyz; other=1', 'admin']);
+  const adminView = buildSigninAdminView(config, state, AFTER_SCHEDULE);
+  assert.equal(JSON.stringify(adminView).includes('admin-cookie'), false, 'cookie never returned');
+  assert.equal(adminView.config.cookie_source, 'admin');
+
+  f = mockFetch(nsHandler());
   try {
-    const state = await runNodeseekSignin({ DB: createD1(), NS_COOKIE: 'x' }, { now: AFTER_SCHEDULE });
-    assert.equal(state.today.status, 'failed');
-    assert.match(state.today.message, /high risk action/);
+    const result = await runNodeseekSigninIfDue(env, AFTER_SCHEDULE + 131 * 60000);
+    assert.equal(result.today.status, 'success', 'cron retries with the new cookie');
+    assert.equal(f.calls.at(-1).init.headers.Cookie, 'admin-cookie=xyz; other=1');
   } finally {
     f.restore();
   }
+
+  // API_SECRET 更换后无法解密，回退到环境变量
+  const rotated = await resolveSigninConfig({ ...env, API_SECRET: 'secret-B' });
+  assert.deepEqual([rotated.cookie, rotated.cookieSource, rotated.storedCookieUnreadable], ['env-cookie=1', 'env', true]);
+
+  await setSigninCookie(env, '');
+  assert.equal((await resolveSigninConfig(env)).cookieSource, 'env', 'clearing reverts to NS_COOKIE');
+  await assert.rejects(setSigninCookie(env, 'a=1\r\nInjected: x'), /invalidCookie/);
+  await assert.rejects(setSigninCookie(env, 'x'.repeat(9000)), /invalidCookie/);
+});
+
+test('signin can be enabled purely from the admin cookie, without NS_COOKIE', async () => {
+  const env = { DB: createD1(), API_SECRET: 's' };
+  assert.equal((await resolveSigninConfig(env)).enabled, false);
+  await setSigninCookie(env, 'only-admin=1');
+  const config = await resolveSigninConfig(env);
+  assert.equal(config.enabled, true);
+  assert.equal(buildSigninPublicView(config, null, AFTER_SCHEDULE).enabled, true);
 });
 
 test('signin cron waits for the scheduled Beijing time, stops after success and caps retries', async () => {
-  const env = { DB: createD1(), NS_COOKIE: 'session=abc' };
+  const env = { DB: createD1(), NS_COOKIE: 'session=abc', API_SECRET: 's' };
   let f = mockFetch(nsHandler());
   try {
     assert.equal(await runNodeseekSigninIfDue(env, BEFORE_SCHEDULE), null);
@@ -415,7 +479,7 @@ test('signin cron waits for the scheduled Beijing time, stops after success and 
     f.restore();
   }
 
-  const env2 = { DB: createD1(), NS_COOKIE: 'session=abc' };
+  const env2 = { DB: createD1(), NS_COOKIE: 'session=abc', API_SECRET: 's' };
   f = mockFetch(nsHandler({ attendance: { success: false, message: 'high risk action' } }));
   try {
     assert.ok(await runNodeseekSigninIfDue(env2, AFTER_SCHEDULE));
@@ -428,20 +492,64 @@ test('signin cron waits for the scheduled Beijing time, stops after success and 
   }
 });
 
-test('signin public view shows 14-day history, streak and monthly gain', async () => {
-  const env = { DB: createD1(), NS_COOKIE: 'c' };
+test('signin public view shows 14-day history, streak, monthly gain and failure kind', async () => {
+  const env = { DB: createD1(), NS_COOKIE: 'c', API_SECRET: 's' };
   const f = mockFetch(nsHandler());
   try {
     const day = 86400000;
     await runNodeseekSignin(env, { now: AFTER_SCHEDULE - 2 * day });
     await runNodeseekSignin(env, { now: AFTER_SCHEDULE - day });
     const state = await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
-    const view = buildSigninPublicView(env, state, AFTER_SCHEDULE);
+    const view = buildSigninPublicView(await resolveSigninConfig(env), state, AFTER_SCHEDULE);
     assert.equal(view.history.length, 14);
     assert.equal(view.history[13].date, beijingDate(AFTER_SCHEDULE));
     assert.equal(view.streak, 3);
     assert.equal(view.month_gain, 14, 'Sep 30 not counted in October');
+    assert.equal(view.failure_kind, '');
     assert.equal(JSON.stringify(view).includes('session'), false);
+  } finally {
+    f.restore();
+  }
+});
+
+// ---------------- 账单站点探测 ----------------
+
+test('billing falls back to the international site on AuthSiteFail and remembers it', async () => {
+  const env = aliyunEnv();
+  const handler = aliyunHandler({ trafficGB: 10, status: 'Running' });
+  const f = mockFetch((u, init) => {
+    if (u.hostname === 'business.aliyuncs.com') {
+      return Response.json({ Code: 'AuthSiteFail', Message: 'auth site failed.' }, { status: 400 });
+    }
+    return handler(u, init);
+  });
+  try {
+    let state = await runAliyunKeepalive(env, { now: 1000, forceBilling: true });
+    assert.equal(state.billing_error, '');
+    assert.equal(state.billing.endpoint, 'business.ap-southeast-1.aliyuncs.com');
+    assert.equal(state.billing.available_amount, 1234.5);
+
+    const before = f.calls.filter(c => c.url.hostname === 'business.aliyuncs.com').length;
+    state = await runAliyunKeepalive(env, { now: 2000, forceBilling: true });
+    assert.equal(f.calls.filter(c => c.url.hostname === 'business.aliyuncs.com').length, before, 'remembered site is tried first');
+  } finally {
+    f.restore();
+  }
+});
+
+test('an explicitly configured billing endpoint is not second-guessed', async () => {
+  const env = aliyunEnv({ ALIYUN_BSS_ENDPOINT: 'business.aliyuncs.com' });
+  const handler = aliyunHandler({ trafficGB: 10, status: 'Running' });
+  const f = mockFetch((u, init) => {
+    if (u.hostname === 'business.aliyuncs.com') {
+      return Response.json({ Code: 'AuthSiteFail', Message: 'auth site failed.' }, { status: 400 });
+    }
+    return handler(u, init);
+  });
+  try {
+    const state = await runAliyunKeepalive(env, { now: 1000, forceBilling: true });
+    assert.match(state.billing_error, /AuthSiteFail/);
+    assert.equal(f.calls.some(c => c.url.hostname === 'business.ap-southeast-1.aliyuncs.com'), false);
   } finally {
     f.restore();
   }

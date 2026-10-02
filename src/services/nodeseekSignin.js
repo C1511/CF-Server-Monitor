@@ -1,9 +1,13 @@
 /**
  * NodeSeek 每日签到（移植自独立的 nodeseek-signin-worker）
- * 先查 GET /api/attendance/board 确认今日是否已签，未签再 POST /api/attendance?random=true（"试试手气"）
+ * 直接 POST /api/attendance?random=true（"试试手气"），以返回结果为准；接口本身幂等，一天只会成功一次
+ * "检查状态"使用 GET /api/attendance/board，只查询不签到
  *
- * 环境变量：
- *   NS_COOKIE         必填，NodeSeek 登录 Cookie 整串，务必以加密 Secret 方式配置
+ * Cookie 来源（优先级从高到低）：
+ *   1. 后台「自动任务」中粘贴的 Cookie（AES-GCM 加密后存入 D1，密钥由 API_SECRET 派生）
+ *   2. 环境变量 NS_COOKIE（加密 Secret）
+ *
+ * 其他环境变量：
  *   NS_SIGNIN_TIME    每日签到时间（北京时间 HH:MM），默认 08:37
  *   NS_SIGNIN_RANDOM  是否使用"试试手气"，默认 true；false 时为固定奖励
  */
@@ -12,29 +16,128 @@ import { sendNotification } from './notification.js';
 
 const NS_ORIGIN = 'https://www.nodeseek.com';
 const STATE_KEY = 'nodeseek_signin_state';
+const COOKIE_KEY = 'nodeseek_signin_cookie';
 const MAX_HISTORY = 30;
 const MAX_ATTEMPTS_PER_DAY = 3;
+const MAX_COOKIE_LENGTH = 8192;
 const RETRY_INTERVAL_MS = 30 * 60 * 1000;
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
+// 失败类型：cookie_invalid 需要更新 Cookie；blocked 为风控/人机验证拦截；error 为其他错误
+export const FAILURE_KINDS = ['cookie_invalid', 'blocked', 'error'];
+
+function parseSchedule(env) {
+  const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(String(env.NS_SIGNIN_TIME || '').trim());
+  if (timeMatch && Number(timeMatch[1]) < 24 && Number(timeMatch[2]) < 60) {
+    return { hour: Number(timeMatch[1]), minute: Number(timeMatch[2]) };
+  }
+  return { hour: 8, minute: 37 };
+}
+
 export function getSigninConfig(env = {}) {
   const cookie = String(env.NS_COOKIE || '').trim();
-  const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(String(env.NS_SIGNIN_TIME || '').trim());
-  let hour = 8;
-  let minute = 37;
-  if (timeMatch && Number(timeMatch[1]) < 24 && Number(timeMatch[2]) < 60) {
-    hour = Number(timeMatch[1]);
-    minute = Number(timeMatch[2]);
-  }
   return {
     enabled: Boolean(cookie),
     cookie,
-    hour,
-    minute,
+    cookieSource: cookie ? 'env' : '',
+    ...parseSchedule(env),
     random: String(env.NS_SIGNIN_RANDOM ?? 'true').trim().toLowerCase() !== 'false'
   };
 }
+
+// ---------------- 后台保存的 Cookie（加密存储） ----------------
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  return Uint8Array.from(atob(value), c => c.charCodeAt(0));
+}
+
+async function cookieKey(apiSecret) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`cfsm-ns-cookie-v1:${apiSecret}`));
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function encryptCookie(apiSecret, cookie) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await cookieKey(apiSecret), new TextEncoder().encode(cookie));
+  return { iv: bytesToBase64(iv), data: bytesToBase64(new Uint8Array(data)) };
+}
+
+async function decryptCookie(apiSecret, stored) {
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: base64ToBytes(stored.iv) },
+    await cookieKey(apiSecret),
+    base64ToBytes(stored.data)
+  );
+  return new TextDecoder().decode(plain);
+}
+
+async function loadStoredCookie(db) {
+  try {
+    const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(COOKIE_KEY).first();
+    const parsed = row?.value ? JSON.parse(row.value) : null;
+    return parsed?.iv && parsed?.data ? parsed : null;
+  } catch (e) {
+    console.error('[nodeseek] 读取 Cookie 失败:', e);
+    return null;
+  }
+}
+
+// 合并后台保存的 Cookie；解密失败（例如 API_SECRET 已更换）时回退到环境变量
+export async function resolveSigninConfig(env) {
+  const config = getSigninConfig(env);
+  const stored = await loadStoredCookie(env.DB);
+  config.cookieUpdatedAt = stored?.updated_at || null;
+  config.storedCookieUnreadable = false;
+  if (stored && env.API_SECRET) {
+    try {
+      const cookie = (await decryptCookie(env.API_SECRET, stored)).trim();
+      if (cookie) {
+        config.cookie = cookie;
+        config.cookieSource = 'admin';
+        config.enabled = true;
+      }
+    } catch (_) {
+      config.storedCookieUnreadable = true;
+    }
+  }
+  return config;
+}
+
+// 后台更新 Cookie；传空值则删除，回退到环境变量
+export async function setSigninCookie(env, cookie, now = Date.now()) {
+  const value = String(cookie ?? '').trim().replace(/^cookie:\s*/i, '');
+  if (value.length > MAX_COOKIE_LENGTH || /[\r\n]/.test(value)) {
+    throw new Error('invalidCookie');
+  }
+  if (value) {
+    const encrypted = await encryptCookie(env.API_SECRET, value);
+    await env.DB.prepare(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    ).bind(COOKIE_KEY, JSON.stringify({ ...encrypted, updated_at: now })).run();
+  } else {
+    await env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(COOKIE_KEY).run();
+  }
+
+  // 换了 Cookie 后清除失效标记，并重置今日尝试次数，让定时任务重新尝试
+  const state = await loadSigninState(env.DB);
+  state.login_invalid = false;
+  state.failure_kind = '';
+  state.error = '';
+  if (state.attempts?.date === beijingDate(now)) {
+    state.attempts = { date: state.attempts.date, count: 0 };
+  }
+  await saveSigninState(env.DB, state);
+  return state;
+}
+
+// ---------------- 请求与结果判定 ----------------
 
 export function beijingDate(now) {
   return new Date(now + BEIJING_OFFSET_MS).toISOString().slice(0, 10);
@@ -54,16 +157,45 @@ function nsHeaders(config) {
     Cookie: config.cookie,
     'User-Agent': USER_AGENT,
     Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
     Origin: NS_ORIGIN,
     Referer: `${NS_ORIGIN}/board`
   };
 }
 
 class SigninError extends Error {
-  constructor(message, { loginInvalid = false } = {}) {
+  constructor(message, kind = 'error') {
     super(message);
-    this.loginInvalid = loginInvalid;
+    this.kind = kind;
   }
+}
+
+function htmlTitle(text) {
+  const match = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text);
+  return match ? match[1].replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+}
+
+// 非 JSON 响应：区分 Cloudflare 人机验证页与其他页面，并带上页面标题便于排查
+export function classifyHtmlResponse(status, text) {
+  const title = htmlTitle(text);
+  const isChallenge = /just a moment|attention required|cf-chl|challenge-platform|cf_chl_opt|turnstile/i.test(text)
+    || /just a moment|attention required|请稍候|安全验证|人机验证/i.test(title);
+  const label = title ? `「${title}」` : '(无标题)';
+  if (isChallenge) {
+    return new SigninError(`被 NodeSeek / Cloudflare 风控拦截，返回了人机验证页 ${label} (HTTP ${status})`, 'blocked');
+  }
+  if (status === 401 || /登录|sign ?in|login/i.test(title)) {
+    return new SigninError(`登录已失效，返回了登录页 ${label} (HTTP ${status})`, 'cookie_invalid');
+  }
+  return new SigninError(`返回了网页而不是接口数据 ${label} (HTTP ${status})，可能被拦截或接口有变化`, 'blocked');
+}
+
+function isAuthMessage(message) {
+  return /USER NOT FOUND|未登录|登录|login|unauthori[sz]ed|未授权/i.test(String(message || ''));
+}
+
+function isRiskMessage(message) {
+  return /high risk|risk|风控|验证/i.test(String(message || ''));
 }
 
 async function requestJson(url, init) {
@@ -73,20 +205,13 @@ async function requestJson(url, init) {
   try {
     data = JSON.parse(text);
   } catch (_) {
-    // 非 JSON 一般是登录页或 Cloudflare 风控页
+    throw classifyHtmlResponse(resp.status, text);
   }
   if (resp.status === 401 || resp.status === 403) {
     const message = data?.message || `HTTP ${resp.status}`;
-    throw new SigninError(`登录可能已失效或被风控拦截：${message}`, { loginInvalid: resp.status === 401 });
-  }
-  if (!data) {
-    throw new SigninError(`返回了非 JSON 内容 (HTTP ${resp.status})，登录可能已失效：${text.slice(0, 120)}`, { loginInvalid: true });
+    throw new SigninError(`请求被拒绝：${message}`, isAuthMessage(message) || resp.status === 401 ? 'cookie_invalid' : 'blocked');
   }
   return data;
-}
-
-function isLoginMessage(message) {
-  return /登录|login|unauthorized|未授权/i.test(String(message || ''));
 }
 
 function toNumberOrNull(value) {
@@ -94,10 +219,11 @@ function toNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-// board 返回 record 表示今日已有签到记录
+// board 返回 record 表示今日已有签到记录（仅"检查状态"使用）
 export function parseBoard(data) {
   if (data?.success === false) {
-    throw new SigninError(`查询签到状态失败：${data.message || '未知错误'}`, { loginInvalid: isLoginMessage(data.message) });
+    const message = data.message || '未知错误';
+    throw new SigninError(`查询签到状态失败：${message}`, isAuthMessage(message) ? 'cookie_invalid' : 'error');
   }
   const record = data?.record && typeof data.record === 'object' ? data.record : null;
   return {
@@ -112,11 +238,19 @@ export function parseAttendance(data) {
   if (data?.success === true) {
     return { status: 'success', gain: toNumberOrNull(data.gain), current: toNumberOrNull(data.current), message };
   }
-  if (/已完成签到|已经签到|重复/.test(message)) {
-    return { status: 'already', gain: null, current: toNumberOrNull(data?.current), message };
+  if (/已完成签到|已经签到|已签到|重复/.test(message)) {
+    return { status: 'already', gain: toNumberOrNull(data?.gain), current: toNumberOrNull(data?.current), message };
   }
-  throw new SigninError(`签到失败：${message || '未知错误'}`, { loginInvalid: isLoginMessage(message) });
+  if (isAuthMessage(message)) {
+    throw new SigninError(`登录已失效：${message}`, 'cookie_invalid');
+  }
+  if (isRiskMessage(message)) {
+    throw new SigninError(`签到被风控拦截：${message}`, 'blocked');
+  }
+  throw new SigninError(`签到失败：${message || '未知错误'}`, 'error');
 }
+
+// ---------------- 状态 ----------------
 
 export async function loadSigninState(db) {
   try {
@@ -164,7 +298,7 @@ async function notifyFailure(env, message) {
  * @param {boolean} options.dryRun 只查询今日状态，不签到
  */
 export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron', now = Date.now() } = {}) {
-  const config = getSigninConfig(env);
+  const config = await resolveSigninConfig(env);
   if (!config.enabled) return { enabled: false };
 
   const state = await loadSigninState(env.DB);
@@ -179,26 +313,23 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
   state.last_checked_at = now;
 
   try {
-    const board = parseBoard(await requestJson(`${NS_ORIGIN}/api/attendance/board?page=1`, {
-      headers: nsHeaders(config)
-    }));
-    state.login_invalid = false;
-    state.error = '';
-
-    if (board.signed) {
+    if (dryRun) {
+      const board = parseBoard(await requestJson(`${NS_ORIGIN}/api/attendance/board?page=1`, {
+        headers: nsHeaders(config)
+      }));
       const previous = state.today?.date === date ? state.today : null;
-      state.today = {
-        date,
-        status: previous?.status === 'success' ? 'success' : 'already',
-        gain: board.gain ?? previous?.gain ?? null,
-        rank: board.rank,
-        current: previous?.current ?? null,
-        message: previous?.message || '今日已签到',
-        at: previous?.at || now,
-        trigger: previous?.trigger || trigger
-      };
-    } else if (dryRun) {
-      state.today = { date, status: 'pending', gain: null, rank: null, current: null, message: 'Cookie 有效，今日尚未签到', at: now, trigger };
+      state.today = board.signed
+        ? {
+          date,
+          status: previous?.status === 'success' ? 'success' : 'already',
+          gain: board.gain ?? previous?.gain ?? null,
+          rank: board.rank,
+          current: previous?.current ?? null,
+          message: previous?.message || '今日已签到',
+          at: previous?.at || now,
+          trigger: previous?.trigger || trigger
+        }
+        : { date, status: 'pending', gain: null, rank: null, current: null, message: 'Cookie 有效，今日尚未签到', at: now, trigger };
     } else {
       const result = parseAttendance(await requestJson(`${NS_ORIGIN}/api/attendance?random=${config.random}`, {
         method: 'POST',
@@ -207,19 +338,27 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
       state.today = { date, ...result, rank: null, at: now, trigger };
     }
 
+    state.login_invalid = false;
+    state.failure_kind = '';
+    state.error = '';
     if (state.today.status === 'success' || state.today.status === 'already') {
       upsertHistory(state, { date, status: state.today.status, gain: state.today.gain });
     }
   } catch (e) {
     const message = e?.message || String(e);
-    console.error('[nodeseek] 签到失败:', message);
-    state.login_invalid = Boolean(e?.loginInvalid);
+    const kind = FAILURE_KINDS.includes(e?.kind) ? e.kind : 'error';
+    console.error('[nodeseek] 签到失败:', kind, message);
+    state.login_invalid = kind === 'cookie_invalid';
+    state.failure_kind = kind;
     if (!dryRun) {
       state.today = { date, status: 'failed', gain: null, rank: null, current: null, message, at: now, trigger };
       upsertHistory(state, { date, status: 'failed', gain: null });
-      // 同一天同一错误只通知一次
+      // 同一错误只通知一次
       if (state.error !== message) {
-        await notifyFailure(env, `${message}${state.login_invalid ? '\n请重新导出 Cookie 并更新 NS_COOKIE' : ''}`);
+        const hint = kind === 'cookie_invalid'
+          ? '\n请在后台「自动任务」中粘贴新的 Cookie'
+          : (kind === 'blocked' ? '\nWorkers 出口 IP 可能被风控，Cookie 不一定失效' : '');
+        await notifyFailure(env, `${message}${hint}`);
       }
     }
     state.error = message;
@@ -231,7 +370,7 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
 
 // 由每分钟的 Cron 调用：到点后签到，失败每 30 分钟重试，每天最多 3 次
 export async function runNodeseekSigninIfDue(env, now = Date.now()) {
-  const config = getSigninConfig(env);
+  const config = await resolveSigninConfig(env);
   if (!config.enabled) return null;
   if (beijingMinutesOfDay(now) < config.hour * 60 + config.minute) return null;
 
@@ -245,6 +384,8 @@ export async function runNodeseekSigninIfDue(env, now = Date.now()) {
 
   return runNodeseekSignin(env, { trigger: 'cron', now });
 }
+
+// ---------------- 视图 ----------------
 
 function recentHistory(state, now, days) {
   const byDate = new Map((state?.history || []).map(item => [item.date, item]));
@@ -279,9 +420,9 @@ function buildTodayView(state, date) {
   return { status: 'none', gain: null, current: null, at: null };
 }
 
-export function buildSigninPublicView(env, state, now = Date.now()) {
-  const config = getSigninConfig(env);
-  if (!config.enabled) return { enabled: false };
+// config 为 resolveSigninConfig 的结果
+export function buildSigninPublicView(config, state, now = Date.now()) {
+  if (!config?.enabled) return { enabled: false };
   const history = recentHistory(state, now, 14);
   const monthPrefix = beijingDate(now).slice(0, 7);
   const monthGain = (state?.history || [])
@@ -294,19 +435,22 @@ export function buildSigninPublicView(env, state, now = Date.now()) {
     history,
     streak: streakDays(history),
     month_gain: monthGain,
-    login_invalid: Boolean(state?.login_invalid)
+    login_invalid: Boolean(state?.login_invalid),
+    failure_kind: state?.failure_kind || ''
   };
 }
 
-export function buildSigninAdminView(env, state, now = Date.now()) {
-  const config = getSigninConfig(env);
+export function buildSigninAdminView(config, state, now = Date.now()) {
   return {
-    ...buildSigninPublicView(env, state, now),
-    enabled: config.enabled,
+    ...buildSigninPublicView(config, state, now),
+    enabled: Boolean(config?.enabled),
     config: {
       schedule: `${formatTime(config.hour, config.minute)}（北京时间）`,
       random: config.random,
-      has_cookie: config.enabled
+      has_cookie: Boolean(config.cookie),
+      cookie_source: config.cookieSource || '',
+      cookie_updated_at: config.cookieUpdatedAt || null,
+      stored_cookie_unreadable: Boolean(config.storedCookieUnreadable)
     },
     detail: state?.today || null,
     attempts: state?.attempts || null,

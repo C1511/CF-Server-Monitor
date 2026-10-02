@@ -11,7 +11,7 @@ import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOpti
 import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
-import { buildSigninPublicView, loadSigninState, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
+import { buildSigninPublicView, loadSigninState, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
@@ -437,13 +437,14 @@ export default {
         if (sys.is_public !== 'true' && !isLoggedIn) {
           return simpleAuthResponse();
         }
-        const [aliyunState, signinState] = await Promise.all([
+        const [aliyunState, signinState, signinConfig] = await Promise.all([
           loadKeepaliveState(env.DB),
-          loadSigninState(env.DB)
+          loadSigninState(env.DB),
+          resolveSigninConfig(env)
         ]);
         return createSuccessResponse({
           aliyun: buildPublicView(env, aliyunState, { includeBilling: isLoggedIn }),
-          signin: buildSigninPublicView(env, signinState)
+          signin: buildSigninPublicView(signinConfig, signinState)
         });
       }},
 

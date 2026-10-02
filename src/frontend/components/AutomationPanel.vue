@@ -69,7 +69,8 @@
         <span>{{ trans.signinLast14 }}</span>
         <span>{{ trans.signinSchedule }} {{ signin.schedule }}</span>
       </div>
-      <div v-if="signin.login_invalid" class="automation-hint automation-warn">{{ trans.signinCookieInvalid }}</div>
+      <div v-if="signin.failure_kind === 'cookie_invalid' || signin.login_invalid" class="automation-hint automation-warn">{{ trans.signinCookieInvalid }}</div>
+      <div v-else-if="signin.failure_kind === 'blocked'" class="automation-hint automation-warn">{{ trans.signinBlocked }}</div>
     </div>
   </div>
 </template>

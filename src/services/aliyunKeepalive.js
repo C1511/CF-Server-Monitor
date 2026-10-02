@@ -8,7 +8,7 @@
  *   ALIYUN_REGION_ID                                 默认 cn-hongkong
  *   ALIYUN_CDT_THRESHOLD_GB                          默认 190，可在后台覆盖（优先级：后台 > 环境变量 > 默认）
  *   ALIYUN_CHECK_INTERVAL_MINUTES                    默认 10（1-60）
- *   ALIYUN_BSS_ENDPOINT                              账单接口域名，默认 business.aliyuncs.com（国际站用 business.ap-southeast-1.aliyuncs.com）
+ *   ALIYUN_BSS_ENDPOINT                              账单接口域名；不设置时自动在中国站 / 国际站之间探测并记住可用的那个
  */
 import { callApi } from '../utils/aliyunApi.js';
 import { loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
@@ -18,6 +18,8 @@ const CDT_ENDPOINT = 'cdt.aliyuncs.com';
 const CDT_VERSION = '2021-08-13';
 const ECS_VERSION = '2014-05-26';
 const BSS_VERSION = '2017-12-14';
+const BSS_ENDPOINT_CN = 'business.aliyuncs.com';
+const BSS_ENDPOINT_INTL = 'business.ap-southeast-1.aliyuncs.com';
 const STATE_KEY = 'aliyun_keepalive_state';
 const CONFIG_KEY = 'aliyun_keepalive_config';
 export const DEFAULT_THRESHOLD_GB = 190;
@@ -37,7 +39,8 @@ export function getAliyunConfig(env = {}) {
   const thresholdGB = thresholdRaw === '' ? DEFAULT_THRESHOLD_GB : Number(thresholdRaw);
   const bssRaw = String(env.ALIYUN_BSS_ENDPOINT || '').trim().toLowerCase();
   // 只允许阿里云账单域名，避免签名请求被发往其他主机
-  const bssEndpoint = /^business(\.[a-z0-9-]+)?\.aliyuncs\.com$/.test(bssRaw) ? bssRaw : 'business.aliyuncs.com';
+  const bssEndpointExplicit = /^business(\.[a-z0-9-]+)?\.aliyuncs\.com$/.test(bssRaw);
+  const bssEndpoint = bssEndpointExplicit ? bssRaw : BSS_ENDPOINT_CN;
   const interval = Number(env.ALIYUN_CHECK_INTERVAL_MINUTES);
   const intervalMinutes = Number.isInteger(interval) && interval >= 1 && interval <= 60 ? interval : 10;
 
@@ -51,7 +54,8 @@ export function getAliyunConfig(env = {}) {
     thresholdSource: thresholdRaw === '' ? 'default' : 'env',
     envThresholdGB: thresholdGB,
     intervalMinutes,
-    bssEndpoint
+    bssEndpoint,
+    bssEndpointExplicit
   };
 }
 
@@ -224,9 +228,9 @@ function callEcs(config, action, params) {
   });
 }
 
-async function callBss(config, action, params = {}) {
+async function callBss(config, action, params = {}, endpoint = config.bssEndpoint) {
   const data = await callApi({
-    endpoint: config.bssEndpoint,
+    endpoint,
     version: BSS_VERSION,
     action,
     params,
@@ -239,18 +243,38 @@ async function callBss(config, action, params = {}) {
   return data;
 }
 
-async function fetchBilling(config, now) {
+function isAuthSiteError(e) {
+  return /AuthSiteFail|auth site/i.test(String(e?.message || e));
+}
+
+// 账号属于中国站还是国际站无法预先得知：未显式配置时依次尝试，AuthSiteFail 表示站点不匹配
+function bssEndpointCandidates(config, preferred) {
+  if (config.bssEndpointExplicit) return [config.bssEndpoint];
+  return [...new Set([preferred, BSS_ENDPOINT_CN, BSS_ENDPOINT_INTL].filter(Boolean))];
+}
+
+async function fetchBilling(config, now, preferredEndpoint) {
   const billingCycle = beijingMonth(now);
-  const [balance, overview] = await Promise.all([
-    callBss(config, 'QueryAccountBalance'),
-    callBss(config, 'QueryBillOverview', { BillingCycle: billingCycle })
-  ]);
-  return {
-    checked_at: now,
-    billing_cycle: billingCycle,
-    ...summarizeAccountBalance(balance),
-    ...summarizeBillOverview(overview)
-  };
+  let lastError = null;
+  for (const endpoint of bssEndpointCandidates(config, preferredEndpoint)) {
+    try {
+      const [balance, overview] = await Promise.all([
+        callBss(config, 'QueryAccountBalance', {}, endpoint),
+        callBss(config, 'QueryBillOverview', { BillingCycle: billingCycle }, endpoint)
+      ]);
+      return {
+        checked_at: now,
+        billing_cycle: billingCycle,
+        endpoint,
+        ...summarizeAccountBalance(balance),
+        ...summarizeBillOverview(overview)
+      };
+    } catch (e) {
+      lastError = e;
+      if (!isAuthSiteError(e)) throw e;
+    }
+  }
+  throw lastError;
 }
 
 async function fetchCdtTraffic(config) {
@@ -399,7 +423,7 @@ export async function runAliyunKeepalive(env, { apply = true, trigger = 'cron', 
   if (forceBilling || !state.billing_attempted_at || now - Number(state.billing_attempted_at) >= BILLING_INTERVAL_MS) {
     state.billing_attempted_at = now;
     try {
-      state.billing = await fetchBilling(config, now);
+      state.billing = await fetchBilling(config, now, state.billing?.endpoint);
       state.billing_error = '';
     } catch (e) {
       state.billing_error = e?.message || String(e);
