@@ -23,6 +23,8 @@ const STATE_KEY = 'nodeseek_signin_state';
 const COOKIE_KEY = 'nodeseek_signin_cookie';
 const OPTIONS_KEY = 'nodeseek_signin_options';
 const MAX_RELAY_BODY = 64 * 1024;
+const MAX_CREDIT_BODY = 256 * 1024;
+const MAX_HISTORY_DAYS = 31;
 const MAX_HISTORY = 30;
 const MAX_ATTEMPTS_PER_DAY = 3;
 const MAX_COOKIE_LENGTH = 8192;
@@ -494,10 +496,14 @@ export async function runNodeseekSigninIfDue(env, now = Date.now()) {
  * 代发服务器领取任务；调用方需先校验该服务器的上报密钥
  * @param {boolean} options.force 手动执行时忽略签到时间（仍不会重复签到）
  */
-export async function getRelayTask(env, serverId, { force = false, now = Date.now() } = {}) {
+export async function getRelayTask(env, serverId, { force = false, stats = false, now = Date.now() } = {}) {
   const config = await resolveSigninConfig(env);
   if (!config.relayServerId || config.relayServerId !== serverId) return { due: false, reason: 'not_relay' };
   if (!config.enabled) return { due: false, reason: 'no_cookie' };
+  if (stats) {
+    // 只查询鸡腿明细，不签到
+    return { due: false, reason: 'stats', stats: true, cookie: sanitizeCookie(config.cookie) };
+  }
 
   const state = await loadSigninState(env.DB);
   const date = beijingDate(now);
@@ -560,6 +566,145 @@ export async function reportRelayResult(env, serverId, httpStatus, body, now = D
   };
 }
 
+// ---------------- 鸡腿明细（/api/account/credit/page-1） ----------------
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// 时间可能是 ISO 字符串、时间戳或不带时区的 "YYYY-MM-DD HH:mm:ss"（按北京时间理解）
+export function parseCreditTime(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+    const n = Number(value);
+    return n < 1e12 ? n * 1000 : n;
+  }
+  const text = String(value).trim();
+  const hasZone = /(Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const normalized = hasZone ? text : `${text.replace(' ', 'T')}+08:00`;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * 解析鸡腿明细。兼容两种记录格式：
+ *   [变动数量, 变动后余额, 说明, 时间] 或 { amount, balance, description, created_at }
+ */
+export function parseCreditRecords(data) {
+  if (data?.success === false) {
+    const message = data.message || '未知错误';
+    throw new SigninError(`查询鸡腿明细失败：${message}`, isAuthMessage(message) ? 'cookie_invalid' : 'error');
+  }
+  const raw = data?.data?.records ?? data?.records ?? data?.data?.list ?? data?.list ?? data?.data;
+  if (!Array.isArray(raw)) {
+    throw new SigninError('无法识别的鸡腿明细格式', 'error');
+  }
+  return raw.map(record => {
+    if (Array.isArray(record)) {
+      return {
+        amount: toFiniteNumber(record[0]),
+        balance: toFiniteNumber(record[1]),
+        description: String(record[2] ?? ''),
+        time: parseCreditTime(record[3])
+      };
+    }
+    if (record && typeof record === 'object') {
+      return {
+        amount: toFiniteNumber(record.amount ?? record.change ?? record.coin ?? record.value),
+        balance: toFiniteNumber(record.balance ?? record.current ?? record.total),
+        description: String(record.description ?? record.desc ?? record.reason ?? record.remark ?? record.title ?? ''),
+        time: parseCreditTime(record.created_at ?? record.createdAt ?? record.time ?? record.timestamp ?? record.date)
+      };
+    }
+    return null;
+  }).filter(record => record && record.time);
+}
+
+// 用明细补全余额与每日签到收益（以 NodeSeek 的记录为准）
+export function applyCreditRecords(state, records, now) {
+  const sorted = [...records].sort((a, b) => b.time - a.time);
+  const latestWithBalance = sorted.find(r => r.balance !== null);
+  if (latestWithBalance) {
+    state.balance = latestWithBalance.balance;
+    state.balance_at = now;
+  }
+
+  const gains = new Map();
+  for (const record of sorted) {
+    if (!/签到/.test(record.description) || !(record.amount > 0)) continue;
+    const date = beijingDate(record.time);
+    const entry = gains.get(date) || { gain: 0, time: record.time };
+    entry.gain += record.amount;
+    gains.set(date, entry);
+  }
+
+  const oldestDate = beijingDate(now - (MAX_HISTORY_DAYS - 1) * 86400000);
+  for (const [date, { gain }] of gains) {
+    if (date < oldestDate) continue;
+    const existing = (state.history || []).find(item => item.date === date);
+    upsertHistory(state, {
+      date,
+      status: existing && ['success', 'already'].includes(existing.status) ? existing.status : 'already',
+      gain
+    });
+  }
+
+  const today = beijingDate(now);
+  const todayGain = gains.get(today);
+  if (todayGain) {
+    if (state.today?.date === today && ['success', 'already'].includes(state.today.status)) {
+      state.today.gain = todayGain.gain;
+    } else {
+      state.today = { date: today, status: 'already', gain: todayGain.gain, rank: null, current: null, message: '今日已签到', at: todayGain.time, trigger: 'relay' };
+    }
+  }
+  if (state.today?.date === today && latestWithBalance) {
+    state.today.current = latestWithBalance.balance;
+  }
+
+  return {
+    balance: latestWithBalance ? latestWithBalance.balance : null,
+    todayGain: todayGain ? todayGain.gain : null,
+    days: gains.size
+  };
+}
+
+// 代发服务器回传鸡腿明细的原始响应
+export async function reportRelayCredit(env, serverId, httpStatus, body, now = Date.now()) {
+  const config = await resolveSigninConfig(env);
+  if (!config.relayServerId || config.relayServerId !== serverId) {
+    return { ok: false, message: '该服务器不是签到代发服务器' };
+  }
+  const state = await loadSigninState(env.DB);
+  const text = String(body || '').slice(0, MAX_CREDIT_BODY);
+  try {
+    const status = Number(httpStatus);
+    if (!(status >= 200 && status < 300)) {
+      throw new SigninError(`查询鸡腿明细失败：HTTP ${httpStatus || '无响应'}`, 'error');
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      throw classifyHtmlResponse(status, text);
+    }
+    const summary = applyCreditRecords(state, parseCreditRecords(data), now);
+    state.credit_error = '';
+    state.credit_sample = '';
+    state.credit_checked_at = now;
+    await saveSigninState(env.DB, state);
+    return { ok: true, ...summary };
+  } catch (e) {
+    state.credit_error = e?.message || String(e);
+    // 记录一小段原始响应，便于排查格式变化
+    state.credit_sample = text.slice(0, 300);
+    state.credit_checked_at = now;
+    await saveSigninState(env.DB, state);
+    return { ok: false, message: state.credit_error };
+  }
+}
+
 // 代发脚本使用的纯文本格式：每行 key=value，值中不含换行
 export function formatRelayText(fields) {
   return Object.entries(fields)
@@ -619,7 +764,9 @@ export function buildSigninPublicView(config, state, now = Date.now()) {
     streak: streakDays(history),
     month_gain: monthGain,
     login_invalid: Boolean(state?.login_invalid),
-    failure_kind: state?.failure_kind || ''
+    failure_kind: state?.failure_kind || '',
+    balance: Number.isFinite(state?.balance) ? state.balance : null,
+    balance_at: state?.balance_at || null
   };
 }
 
@@ -638,7 +785,11 @@ export function buildSigninAdminView(config, state, now = Date.now()) {
     },
     relay_seen_at: state?.relay_seen_at || null,
     relay_reported_at: state?.relay_reported_at || null,
-    detail: state?.today || null,
+    // 只展示当天的签到详情，避免跨天后显示昨天的消息
+    detail: state?.today?.date === beijingDate(now) ? state.today : null,
+    credit_checked_at: state?.credit_checked_at || null,
+    credit_error: state?.credit_error || '',
+    credit_sample: state?.credit_sample || '',
     attempts: state?.attempts || null,
     error: state?.error || '',
     last_checked_at: state?.last_checked_at || null,

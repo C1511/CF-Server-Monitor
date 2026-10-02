@@ -50,8 +50,8 @@
           <div class="automation-stat-value">{{ signin.month_gain }}</div>
           <div class="automation-stat-label">{{ trans.signinMonthGain }}</div>
         </div>
-        <div v-if="signin.today.current != null">
-          <div class="automation-stat-value">{{ signin.today.current }}</div>
+        <div v-if="(signin.balance ?? signin.today.current) != null">
+          <div class="automation-stat-value">{{ signin.balance ?? signin.today.current }}</div>
           <div class="automation-stat-label">{{ trans.signinCurrent }}</div>
         </div>
       </div>

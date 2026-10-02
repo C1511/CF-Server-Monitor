@@ -151,7 +151,14 @@
           <button class="btn" :disabled="signinBusy" @click="signinAction('signin_check')">🔍 {{ trans.signinCheck }}</button>
           <button class="btn btn-primary" :disabled="signinBusy" @click="signinAction('signin_run')">✔ {{ trans.signinRunNow }}</button>
         </div>
-        <p v-else class="text-sm relay-manual"><code>{{ trans.signinRelayManual }}</code></p>
+        <template v-else>
+          <p class="text-sm relay-manual"><code>{{ trans.signinRelayManual }}</code></p>
+          <p class="text-sm relay-manual"><code>{{ trans.signinRelayStats }}</code></p>
+        </template>
+        <div v-if="signin.credit_error" class="warning-box mb-2">
+          <div>{{ trans.signinCreditError }}：{{ signin.credit_error }}</div>
+          <div v-if="signin.credit_sample" class="text-sm text-muted credit-sample">{{ signin.credit_sample }}</div>
+        </div>
 
         <div v-if="signin.error" class="danger-box mb-2">
           <div v-if="signin.failure_kind === 'cookie_invalid'"><b>{{ trans.signinCookieInvalid }}</b></div>
@@ -162,7 +169,7 @@
         <div class="automation-kv">
           <div><span>{{ trans.signinToday }}</span><b>{{ signinStatusText(signin.today.status) }}{{ signin.detail?.message ? ' · ' + signin.detail.message : '' }}</b></div>
           <div><span>{{ trans.signinGain }}</span><b>{{ signin.today.gain ?? '-' }}</b></div>
-          <div><span>{{ trans.signinCurrent }}</span><b>{{ signin.today.current ?? '-' }}</b></div>
+          <div><span>{{ trans.signinCurrent }}</span><b>{{ signin.balance ?? signin.today.current ?? '-' }}<template v-if="signin.balance_at"> · {{ formatDateTime(signin.balance_at) }}</template></b></div>
           <div><span>{{ trans.signinStreak }}</span><b>{{ signin.streak }} {{ trans.signinDays }}</b></div>
           <div><span>{{ trans.signinMonthGain }}</span><b>{{ signin.month_gain }}</b></div>
           <div><span>{{ trans.signinSchedule }}</span><b>{{ signin.config.schedule }}</b></div>
@@ -509,6 +516,13 @@ watch(() => props.activeTab, (tab) => {
   border-radius: 4px;
   background: var(--bg-secondary);
   font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.credit-sample {
+  margin-top: 4px;
+  font-family: monospace;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }

@@ -22,8 +22,11 @@ import {
   resolveSigninConfig,
   runNodeseekSignin,
   formatRelayText,
+  applyCreditRecords,
   getRelayTask,
   loadSigninState,
+  parseCreditRecords,
+  reportRelayCredit,
   reportRelayResult,
   runNodeseekSigninIfDue,
   sanitizeCookie,
@@ -772,4 +775,98 @@ test('billing still shows the balance when only the bill overview fails', async 
   } finally {
     f.restore();
   }
+});
+
+// ---------------- 鸡腿明细 ----------------
+
+test('credit records parse array and object formats with Beijing-local timestamps', () => {
+  const fromArrays = parseCreditRecords({ success: true, data: { records: [
+    [5, 1300, '签到收益5个鸡腿', '2026-10-02 08:37:10'],
+    [-10, 1295, '购买邀请码', '2026-10-01T12:00:00.000Z']
+  ] } });
+  assert.equal(fromArrays.length, 2);
+  assert.deepEqual([fromArrays[0].amount, fromArrays[0].balance], [5, 1300]);
+  assert.equal(fromArrays[0].time, Date.parse('2026-10-02T08:37:10+08:00'), 'no timezone -> Beijing time');
+  assert.equal(beijingDate(fromArrays[0].time), '2026-10-02');
+
+  const fromObjects = parseCreditRecords({ data: [{ amount: 3, balance: 50, description: '签到', created_at: 1790900000 }] });
+  assert.equal(fromObjects[0].time, 1790900000 * 1000, 'seconds epoch');
+
+  assert.throws(() => parseCreditRecords({ success: false, message: 'USER NOT FOUND' }), /USER NOT FOUND/);
+  assert.throws(() => parseCreditRecords({ success: true, data: { weird: 1 } }), /无法识别/);
+});
+
+test('credit records fill balance, today gain and back-fill this month\'s check-in history', () => {
+  const now = AFTER_SCHEDULE; // 北京时间 2026-10-02 08:40
+  const state = { history: [{ date: '2026-10-02', status: 'already', gain: null }], today: { date: '2026-10-02', status: 'already', gain: null, current: null } };
+  const summary = applyCreditRecords(state, [
+    { amount: 6, balance: 1306, description: '签到收益6个鸡腿', time: Date.parse('2026-10-02T08:37:00+08:00') },
+    { amount: -2, balance: 1300, description: '打赏', time: Date.parse('2026-10-01T20:00:00+08:00') },
+    { amount: 4, balance: 1302, description: '签到收益4个鸡腿', time: Date.parse('2026-10-01T08:37:00+08:00') },
+    { amount: 5, balance: 1298, description: '签到收益5个鸡腿', time: Date.parse('2026-09-30T08:37:00+08:00') }
+  ], now);
+  assert.deepEqual(summary, { balance: 1306, todayGain: 6, days: 3 });
+  assert.equal(state.balance, 1306);
+  assert.deepEqual([state.today.gain, state.today.current], [6, 1306]);
+  assert.deepEqual(state.history.map(h => [h.date, h.status, h.gain]), [
+    ['2026-10-02', 'already', 6], ['2026-10-01', 'already', 4], ['2026-09-30', 'already', 5]
+  ]);
+  const view = buildSigninPublicView({ enabled: true, hour: 8, minute: 37 }, state, now);
+  assert.equal(view.month_gain, 10, 'October only');
+  assert.equal(view.balance, 1306);
+  assert.equal(view.streak, 3);
+});
+
+test('admin view only shows today\'s check-in detail', async () => {
+  const config = { enabled: true, hour: 8, minute: 37, random: true, cookie: 'c' };
+  const state = { history: [], today: { date: '2026-10-01', status: 'already', message: '今天已完成签到，请勿重复操作' } };
+  assert.equal(buildSigninAdminView(config, state, AFTER_SCHEDULE).detail, null);
+});
+
+test('relay stats task and credit report update the panel', async () => {
+  const env = await relayEnv();
+  const task = await getRelayTask(env, 'srv-hk', { stats: true, now: AFTER_SCHEDULE });
+  assert.deepEqual([task.stats, task.cookie, task.due], [true, 'session=s1', false]);
+
+  const body = JSON.stringify({ success: true, data: { records: [[7, 2000, '签到收益7个鸡腿', '2026-10-02 08:37:05']] } });
+  const ok = await reportRelayCredit(env, 'srv-hk', '200', body, AFTER_SCHEDULE);
+  assert.deepEqual([ok.ok, ok.balance, ok.todayGain], [true, 2000, 7]);
+  const state = await loadSigninState(env.DB);
+  assert.deepEqual([state.balance, state.today.gain, state.credit_error], [2000, 7, '']);
+
+  const bad = await reportRelayCredit(env, 'srv-hk', '200', '<html><title>NodeSeek</title></html>', AFTER_SCHEDULE);
+  assert.equal(bad.ok, false);
+  const after = await loadSigninState(env.DB);
+  assert.equal(after.balance, 2000, 'previous balance kept');
+  assert.ok(after.credit_sample.includes('<html>'));
+
+  assert.equal((await reportRelayCredit(env, 'intruder', '200', body, AFTER_SCHEDULE)).ok, false);
+
+  const { default: worker } = await import('../src/index.js');
+  const secret = await deriveAgentSecret(env.API_SECRET, 'srv-hk');
+  const res = await worker.fetch(new Request('https://board.example/relay/nodeseek/credit', {
+    method: 'POST', headers: { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': secret, 'X-Relay-Status': '200' }, body
+  }), env, { waitUntil() {} });
+  const text = await res.text();
+  assert.match(text, /^ok=1$/m);
+  assert.match(text, /^balance=2000$/m);
+});
+
+// ---------------- 访客模式已移除 ----------------
+
+test('visitor mode is removed: data endpoints require login even if is_public was saved as true', async () => {
+  const { default: worker } = await import('../src/index.js');
+  const { clearSiteSettingsCache } = await import('../src/utils/settings.js');
+  const db = createD1();
+  await db.prepare("INSERT INTO settings (key, value) VALUES ('site_options', ?)").bind(JSON.stringify({ is_public: 'true', jwt_secret: 'z'.repeat(64) })).run();
+  clearSiteSettingsCache();
+  const env = { DB: db, API_SECRET: 'visitor-test-secret' };
+  const get = path => worker.fetch(new Request(`https://board.example${path}`), env, { waitUntil() {} });
+
+  for (const path of ['/api/automation', '/api/server?id=x', '/api/history/all?id=x&hours=1']) {
+    assert.equal((await get(path)).status, 401, path);
+  }
+  const config = await (await get('/api/config')).json();
+  assert.equal(config.is_public, false);
+  clearSiteSettingsCache();
 });

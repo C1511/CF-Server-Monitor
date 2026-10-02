@@ -11,7 +11,7 @@ import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOpti
 import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
-import { buildSigninPublicView, formatRelayText, getRelayTask, loadSigninState, reportRelayResult, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
+import { buildSigninPublicView, formatRelayText, getRelayTask, loadSigninState, reportRelayCredit, reportRelayResult, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
 import { verifyAgentSecret } from './utils/agentSecret.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
@@ -300,8 +300,23 @@ export default {
       { method: 'POST', path: '/relay/nodeseek/task', handler: async () => {
         const serverId = await authenticateRelay(request, env);
         if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
-        const task = await getRelayTask(env, serverId, { force: url.searchParams.get('force') === '1' });
+        const task = await getRelayTask(env, serverId, {
+          force: url.searchParams.get('force') === '1',
+          stats: url.searchParams.get('stats') === '1'
+        });
         return relayTextResponse(task);
+      }},
+      { method: 'POST', path: '/relay/nodeseek/credit', handler: async () => {
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const result = await reportRelayCredit(env, serverId, request.headers.get('X-Relay-Status'), await request.text());
+        return relayTextResponse({
+          ok: result.ok ? 1 : 0,
+          balance: result.balance,
+          today_gain: result.todayGain,
+          days: result.days,
+          message: result.message
+        });
       }},
       { method: 'POST', path: '/relay/nodeseek/report', handler: async () => {
         const serverId = await authenticateRelay(request, env);

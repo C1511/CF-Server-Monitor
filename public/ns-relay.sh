@@ -11,6 +11,7 @@
 #   cfsm-ns-relay run [--force]   立即执行（--force 忽略签到时间，但不会重复签到）
 #   cfsm-ns-relay check           只检查与面板的连接和今日任务，不签到
 #   cfsm-ns-relay update          从面板更新本脚本
+#   cfsm-ns-relay stats           只查询鸡腿余额与签到收益，不签到
 #   cfsm-ns-relay uninstall       卸载
 
 set -u
@@ -98,9 +99,36 @@ panel_request() {
 }
 
 fetch_task() {
-    force_query=""
-    [ "${1:-}" = "force" ] && force_query="?force=1"
-    RELAY_STATUS="" panel_request "/relay/nodeseek/task$force_query"
+    query=""
+    [ "${1:-}" = "force" ] && query="?force=1"
+    [ "${1:-}" = "stats" ] && query="?stats=1"
+    RELAY_STATUS="" panel_request "/relay/nodeseek/task$query"
+}
+
+# 查询鸡腿明细第一页并原样回传面板解析（余额、每日签到收益）
+fetch_credit() {
+    credit_cookie="$1"
+    credit_file="$2"
+    credit_code="$({
+        printf 'url = "%s/api/account/credit/page-1"\n' "$NS_ORIGIN"
+        printf 'header = "Cookie: %s"\n' "$(curl_quote "$credit_cookie")"
+        printf 'header = "User-Agent: %s"\n' "$USER_AGENT"
+        printf 'header = "Accept: application/json, text/plain, */*"\n'
+        printf 'header = "Accept-Language: zh-CN,zh;q=0.9"\n'
+        printf 'header = "Referer: %s/credit"\n' "$NS_ORIGIN"
+    } | curl -4 -sS -m 30 --connect-timeout 10 -o "$credit_file" -w '%{http_code}' -K - 2>/dev/null)" || credit_code="000"
+    credit_cookie=""
+    head -c 262144 "$credit_file" > "$credit_file.report" 2>/dev/null
+    credit_result="$(RELAY_STATUS="$credit_code" panel_request "/relay/nodeseek/credit" "$credit_file.report")" || {
+        log "[WARN] 回传鸡腿明细失败"
+        return 0
+    }
+    if [ "$(field ok "$credit_result")" = "1" ]; then
+        log "鸡腿余额：$(field balance "$credit_result")  今日签到获得：$(field today_gain "$credit_result")"
+    else
+        log "[WARN] 鸡腿明细：$(field message "$credit_result")"
+    fi
+    rm -f "$credit_file.report"
 }
 
 signin_request() {
@@ -193,6 +221,7 @@ cmd_run() {
         log "第 ${attempt} 次签到（IPv4）..."
         do_signin "$cookie" "$random" "$tmp_body"
         code="$SIGNIN_CODE"
+        stats_cookie="${SIGNIN_COOKIE:-$cookie}"
         cookie=""
         RELAY_COOKIE="$SIGNIN_COOKIE"
         SIGNIN_COOKIE=""
@@ -212,9 +241,12 @@ cmd_run() {
         log "结果：$(field kind "$result") $(field message "$result")"
 
         if [ "$(field done "$result")" = "1" ]; then
+            fetch_credit "$stats_cookie" "$tmp_body"
+            stats_cookie=""
             trim_log
             return 0
         fi
+        stats_cookie=""
         if [ "$(field retry "$result")" != "1" ]; then
             trim_log
             return 1
@@ -326,6 +358,19 @@ cmd_check_inline() {
     fi
 }
 
+cmd_stats() {
+    load_config
+    task="$(fetch_task stats)" || die "无法连接面板 $RELAY_URL"
+    if [ -n "$(field error "$task")" ]; then
+        die "面板拒绝请求：$(field error "$task")"
+    fi
+    [ "$(field stats "$task")" = "true" ] || die "面板未下发查询任务：$(field reason "$task")"
+    tmp_credit="$(mktemp "${TMPDIR:-/tmp}/cfsm-ns.XXXXXX")" || die "无法创建临时文件"
+    trap 'rm -f "$tmp_credit" "$tmp_credit.report"' EXIT INT TERM
+    fetch_credit "$(field cookie "$task")" "$tmp_credit"
+    task=""
+}
+
 # 从面板下载最新版脚本覆盖本机副本（配置与 crontab 保持不变）
 cmd_update() {
     load_config
@@ -353,9 +398,10 @@ case "${1:-}" in
         ;;
     check) cmd_check ;;
     update) cmd_update ;;
+    stats) cmd_stats ;;
     uninstall) cmd_uninstall ;;
     *)
-        printf '用法：%s install|run [--force]|check|uninstall\n' "$0"
+        printf '用法：%s install|run [--force]|check|stats|update|uninstall\n' "$0"
         exit 1
         ;;
 esac

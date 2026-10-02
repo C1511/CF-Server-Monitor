@@ -145,11 +145,6 @@
 
         <div class="form-row">
           <div class="form-group flex-1 checkbox-item">
-            <input type="checkbox" id="cfg_is_public" v-model="settings.is_public">
-            <label><b>{{ trans.publicAccess }}</b></label>
-          </div>
-
-          <div class="form-group flex-1 checkbox-item">
             <input type="checkbox" id="cfg_show_price" v-model="settings.show_price">
             <label>{{ trans.showPrice }}</label>
           </div>

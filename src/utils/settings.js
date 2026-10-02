@@ -73,7 +73,7 @@ const defaults = {
   preferred_theme: 'auto',
   default_language: 'auto',
   theme_options: {},
-  is_public: 'true',
+  is_public: 'false',
   show_price: 'true',
   show_expire: 'true',
   show_tf: 'true',
@@ -675,6 +675,9 @@ export async function loadSiteSettings(db, options = {}) {
   } catch (e) {
     console.error('加载站点设置失败:', e);
   }
+
+  // 已移除访客模式：面板、服务器数据、历史与实时推送一律需要登录
+  result.is_public = 'false';
 
   cachedSiteSettings = result;
   siteSettingsCacheExpiry = now + SITE_SETTINGS_CACHE_TTL_MS;
