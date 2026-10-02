@@ -6,8 +6,9 @@
  *   ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET  必填，务必以加密 Secret 方式配置
  *   ALIYUN_ECS_INSTANCE_ID                           必填
  *   ALIYUN_REGION_ID                                 默认 cn-hongkong
- *   ALIYUN_CDT_THRESHOLD_GB                          默认 180
+ *   ALIYUN_CDT_THRESHOLD_GB                          默认 190，可在后台覆盖（优先级：后台 > 环境变量 > 默认）
  *   ALIYUN_CHECK_INTERVAL_MINUTES                    默认 10（1-60）
+ *   ALIYUN_BSS_ENDPOINT                              账单接口域名，默认 business.aliyuncs.com（国际站用 business.ap-southeast-1.aliyuncs.com）
  */
 import { callApi } from '../utils/aliyunApi.js';
 import { loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
@@ -16,7 +17,13 @@ import { sendNotification } from './notification.js';
 const CDT_ENDPOINT = 'cdt.aliyuncs.com';
 const CDT_VERSION = '2021-08-13';
 const ECS_VERSION = '2014-05-26';
+const BSS_VERSION = '2017-12-14';
 const STATE_KEY = 'aliyun_keepalive_state';
+const CONFIG_KEY = 'aliyun_keepalive_config';
+export const DEFAULT_THRESHOLD_GB = 190;
+export const MAX_THRESHOLD_GB = 100000;
+const BILLING_INTERVAL_MS = 60 * 60 * 1000;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 const MAX_EVENTS = 30;
 const WARN_PERCENT = 90;
 const BYTES_PER_GB = 1024 ** 3;
@@ -27,7 +34,10 @@ export function getAliyunConfig(env = {}) {
   const instanceId = String(env.ALIYUN_ECS_INSTANCE_ID || '').trim();
   const regionId = String(env.ALIYUN_REGION_ID || '').trim() || 'cn-hongkong';
   const thresholdRaw = String(env.ALIYUN_CDT_THRESHOLD_GB ?? '').trim();
-  const thresholdGB = thresholdRaw === '' ? 180 : Number(thresholdRaw);
+  const thresholdGB = thresholdRaw === '' ? DEFAULT_THRESHOLD_GB : Number(thresholdRaw);
+  const bssRaw = String(env.ALIYUN_BSS_ENDPOINT || '').trim().toLowerCase();
+  // 只允许阿里云账单域名，避免签名请求被发往其他主机
+  const bssEndpoint = /^business(\.[a-z0-9-]+)?\.aliyuncs\.com$/.test(bssRaw) ? bssRaw : 'business.aliyuncs.com';
   const interval = Number(env.ALIYUN_CHECK_INTERVAL_MINUTES);
   const intervalMinutes = Number.isInteger(interval) && interval >= 1 && interval <= 60 ? interval : 10;
 
@@ -38,7 +48,10 @@ export function getAliyunConfig(env = {}) {
     instanceId,
     regionId,
     thresholdGB,
-    intervalMinutes
+    thresholdSource: thresholdRaw === '' ? 'default' : 'env',
+    envThresholdGB: thresholdGB,
+    intervalMinutes,
+    bssEndpoint
   };
 }
 
@@ -105,6 +118,87 @@ export function summarizeInstance(instance = {}) {
   };
 }
 
+export function isValidThresholdGB(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return false;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n <= MAX_THRESHOLD_GB;
+}
+
+async function loadOverrides(db) {
+  try {
+    const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(CONFIG_KEY).first();
+    const parsed = row?.value ? JSON.parse(row.value) : null;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    console.error('[aliyun] 读取保活配置失败:', e);
+    return {};
+  }
+}
+
+// 合并后台保存的覆盖配置
+export async function resolveAliyunConfig(env) {
+  const config = getAliyunConfig(env);
+  const overrides = await loadOverrides(env.DB);
+  if (isValidThresholdGB(overrides.threshold_gb)) {
+    config.thresholdGB = Number(overrides.threshold_gb);
+    config.thresholdSource = 'custom';
+  }
+  return config;
+}
+
+function parseAmount(value) {
+  const n = Number(String(value ?? '').replace(/,/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+export function summarizeAccountBalance(data = {}) {
+  const d = data.Data || {};
+  return {
+    currency: d.Currency || 'CNY',
+    available_amount: parseAmount(d.AvailableAmount),
+    available_cash_amount: parseAmount(d.AvailableCashAmount),
+    credit_amount: parseAmount(d.CreditAmount)
+  };
+}
+
+// 按产品汇总本月账单：PretaxAmount 为优惠后应付，PretaxGrossAmount 为原价
+export function summarizeBillOverview(data = {}) {
+  const byProduct = new Map();
+  for (const item of data.Data?.Items?.Item || []) {
+    const name = item.ProductName || item.ProductCode || '-';
+    const entry = byProduct.get(name) || { code: item.ProductCode || '', name, pretax_amount: 0, gross_amount: 0, coupon_amount: 0, outstanding_amount: 0 };
+    entry.pretax_amount += parseAmount(item.PretaxAmount);
+    entry.gross_amount += parseAmount(item.PretaxGrossAmount);
+    entry.coupon_amount += parseAmount(item.DeductedByCoupons);
+    entry.outstanding_amount += parseAmount(item.OutstandingAmount);
+    byProduct.set(name, entry);
+  }
+  const products = [...byProduct.values()]
+    .map(p => ({
+      ...p,
+      pretax_amount: round2(p.pretax_amount),
+      gross_amount: round2(p.gross_amount),
+      coupon_amount: round2(p.coupon_amount),
+      outstanding_amount: round2(p.outstanding_amount)
+    }))
+    .filter(p => p.pretax_amount || p.gross_amount)
+    .sort((a, b) => b.pretax_amount - a.pretax_amount || b.gross_amount - a.gross_amount);
+  return {
+    month_pretax_amount: round2(products.reduce((sum, p) => sum + p.pretax_amount, 0)),
+    month_gross_amount: round2(products.reduce((sum, p) => sum + p.gross_amount, 0)),
+    month_outstanding_amount: round2(products.reduce((sum, p) => sum + p.outstanding_amount, 0)),
+    products
+  };
+}
+
+function beijingMonth(now) {
+  return new Date(now + BEIJING_OFFSET_MS).toISOString().slice(0, 7);
+}
+
 export function decideKeepaliveAction(status, usedGB, thresholdGB) {
   if (usedGB < thresholdGB) {
     return status === 'Stopped'
@@ -128,6 +222,35 @@ function callEcs(config, action, params) {
     params: { RegionId: config.regionId, ...params },
     ...credentials(config)
   });
+}
+
+async function callBss(config, action, params = {}) {
+  const data = await callApi({
+    endpoint: config.bssEndpoint,
+    version: BSS_VERSION,
+    action,
+    params,
+    ...credentials(config)
+  });
+  // 账单接口出错时也可能返回 HTTP 200
+  if (data?.Success === false) {
+    throw new Error(`${action} 调用失败: ${data.Code} - ${data.Message}`);
+  }
+  return data;
+}
+
+async function fetchBilling(config, now) {
+  const billingCycle = beijingMonth(now);
+  const [balance, overview] = await Promise.all([
+    callBss(config, 'QueryAccountBalance'),
+    callBss(config, 'QueryBillOverview', { BillingCycle: billingCycle })
+  ]);
+  return {
+    checked_at: now,
+    billing_cycle: billingCycle,
+    ...summarizeAccountBalance(balance),
+    ...summarizeBillOverview(overview)
+  };
 }
 
 async function fetchCdtTraffic(config) {
@@ -207,9 +330,9 @@ function monthKey(now) {
  * @param {object} options.apply   是否按规则开关机；false 时只刷新数据
  * @param {string} options.trigger cron | manual
  */
-export async function runAliyunKeepalive(env, { apply = true, trigger = 'cron', now = Date.now() } = {}) {
-  const config = getAliyunConfig(env);
-  if (!config.enabled) return { enabled: false };
+export async function runAliyunKeepalive(env, { apply = true, trigger = 'cron', now = Date.now(), forceBilling = false } = {}) {
+  if (!getAliyunConfig(env).enabled) return { enabled: false };
+  const config = await resolveAliyunConfig(env);
 
   const state = await loadKeepaliveState(env.DB);
   state.attempted_at = now;
@@ -272,6 +395,18 @@ export async function runAliyunKeepalive(env, { apply = true, trigger = 'cron', 
     state.error_at = now;
   }
 
+  // 账单数据每小时更新一次；失败不影响保活，也不推送通知
+  if (forceBilling || !state.billing_attempted_at || now - Number(state.billing_attempted_at) >= BILLING_INTERVAL_MS) {
+    state.billing_attempted_at = now;
+    try {
+      state.billing = await fetchBilling(config, now);
+      state.billing_error = '';
+    } catch (e) {
+      state.billing_error = e?.message || String(e);
+      console.error('[aliyun] 账单查询失败:', state.billing_error);
+    }
+  }
+
   await saveKeepaliveState(env.DB, state);
   return state;
 }
@@ -302,15 +437,54 @@ export async function setAliyunKeepalivePaused(env, paused, now = Date.now()) {
   return state;
 }
 
-// 后台完整视图（仍不返回 AccessKey Secret）
-export function buildAdminView(env, state) {
-  const config = getAliyunConfig(env);
+/**
+ * 后台修改阈值；传 null 恢复为环境变量/默认值
+ * 修改后立即重算已保存的用量百分比，开关机在下一次检查时按新阈值执行
+ */
+export async function setAliyunThreshold(env, value, now = Date.now()) {
+  const before = await resolveAliyunConfig(env);
+  const overrides = await loadOverrides(env.DB);
+  if (value === null || value === undefined || value === '') {
+    delete overrides.threshold_gb;
+  } else {
+    if (!isValidThresholdGB(value)) {
+      throw new Error('invalidThreshold');
+    }
+    overrides.threshold_gb = Math.round(Number(value) * 100) / 100;
+  }
+  await env.DB.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).bind(CONFIG_KEY, JSON.stringify(overrides)).run();
+
+  const after = await resolveAliyunConfig(env);
+  const state = await loadKeepaliveState(env.DB);
+  if (after.thresholdGB !== before.thresholdGB) {
+    if (state.cdt) {
+      state.cdt.threshold_gb = after.thresholdGB;
+      state.cdt.percent = Math.round((state.cdt.non_mainland_gb / after.thresholdGB) * 1000) / 10;
+    }
+    addEvent(state, {
+      at: now,
+      type: 'config',
+      trigger: 'manual',
+      message: `阈值 ${before.thresholdGB} GB → ${after.thresholdGB} GB`
+    });
+    await saveKeepaliveState(env.DB, state);
+  }
+  return { config: after, state };
+}
+
+// 后台完整视图（仍不返回 AccessKey Secret）；config 为 resolveAliyunConfig 的结果
+export function buildAdminView(config, state) {
   return {
     enabled: config.enabled,
     config: {
       region_id: config.regionId,
       instance_id: config.instanceId,
       threshold_gb: config.thresholdGB,
+      threshold_source: config.thresholdSource,
+      env_threshold_gb: config.envThresholdGB,
+      default_threshold_gb: DEFAULT_THRESHOLD_GB,
       interval_minutes: config.intervalMinutes,
       access_key_id: maskAccessKeyId(config.accessKeyId),
       has_access_key_secret: Boolean(config.accessKeySecret)
@@ -320,7 +494,7 @@ export function buildAdminView(env, state) {
 }
 
 // 前台摘要：不含实例 ID、公网 IP、AccessKey 和错误详情
-export function buildPublicView(env, state) {
+export function buildPublicView(env, state, { includeBilling = false } = {}) {
   const config = getAliyunConfig(env);
   if (!config.enabled || !state?.cdt) {
     return { enabled: config.enabled, ready: false };
@@ -344,6 +518,13 @@ export function buildPublicView(env, state) {
       memory_mb: state.ecs.memory_mb,
       region: state.ecs.region
     } : null,
-    last_action: state.last_action ? { type: state.last_action.type, at: state.last_action.at } : null
+    last_action: state.last_action ? { type: state.last_action.type, at: state.last_action.at } : null,
+    // 账户余额与消费仅对已登录管理员返回
+    billing: includeBilling && state.billing ? {
+      currency: state.billing.currency,
+      available_amount: state.billing.available_amount,
+      month_pretax_amount: state.billing.month_pretax_amount,
+      checked_at: state.billing.checked_at
+    } : null
   };
 }

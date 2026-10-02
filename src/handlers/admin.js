@@ -12,7 +12,7 @@ import { getNextServerHistoryPartitionId, HISTORY_MAX_PARTITION_ID } from '../da
 import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, normalizeWssReportInterval, validateAgentConfigInput, validatePingNode, validateNetworkInterfaces } from '../utils/agentConfig.js';
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
 import { deriveAgentSecret } from '../utils/agentSecret.js';
-import { buildAdminView, loadKeepaliveState, runAliyunKeepalive, setAliyunKeepalivePaused } from '../services/aliyunKeepalive.js';
+import { buildAdminView, loadKeepaliveState, resolveAliyunConfig, runAliyunKeepalive, setAliyunKeepalivePaused, setAliyunThreshold } from '../services/aliyunKeepalive.js';
 import { buildSigninAdminView, loadSigninState, runNodeseekSignin } from '../services/nodeseekSignin.js';
 import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
@@ -755,23 +755,37 @@ async function handleSendTestNotificationAction({ data }) {
   }
 }
 
+async function aliyunAdminResponse(env, state) {
+  const config = await resolveAliyunConfig(env);
+  return createSuccessResponse({ success: true, ...buildAdminView(config, state?.enabled === false ? null : state) });
+}
+
 async function handleAliyunStatusAction({ env }) {
-  return createSuccessResponse({ success: true, ...buildAdminView(env, await loadKeepaliveState(env.DB)) });
+  return aliyunAdminResponse(env, await loadKeepaliveState(env.DB));
 }
 
 async function handleAliyunRefreshAction({ env }) {
-  const state = await runAliyunKeepalive(env, { apply: false, trigger: 'manual' });
-  return createSuccessResponse({ success: true, ...buildAdminView(env, state.enabled === false ? null : state) });
+  return aliyunAdminResponse(env, await runAliyunKeepalive(env, { apply: false, trigger: 'manual', forceBilling: true }));
 }
 
 async function handleAliyunRunAction({ env }) {
-  const state = await runAliyunKeepalive(env, { apply: true, trigger: 'manual' });
-  return createSuccessResponse({ success: true, ...buildAdminView(env, state.enabled === false ? null : state) });
+  return aliyunAdminResponse(env, await runAliyunKeepalive(env, { apply: true, trigger: 'manual' }));
 }
 
 async function handleAliyunPauseAction({ env, data }) {
-  const state = await setAliyunKeepalivePaused(env, data.paused === true);
-  return createSuccessResponse({ success: true, ...buildAdminView(env, state) });
+  return aliyunAdminResponse(env, await setAliyunKeepalivePaused(env, data.paused === true));
+}
+
+async function handleAliyunSetThresholdAction({ env, data }) {
+  try {
+    const { state } = await setAliyunThreshold(env, data.threshold_gb ?? null);
+    return aliyunAdminResponse(env, state);
+  } catch (e) {
+    if (e?.message === 'invalidThreshold') {
+      return createBadRequestResponse('invalidThreshold');
+    }
+    throw e;
+  }
 }
 
 async function handleSigninStatusAction({ env }) {
@@ -796,6 +810,7 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   aliyun_refresh: handleAliyunRefreshAction,
   aliyun_run: handleAliyunRunAction,
   aliyun_pause: handleAliyunPauseAction,
+  aliyun_set_threshold: handleAliyunSetThresholdAction,
   get_settings: handleGetSettingsAction,
   start_theme_preview: handleStartThemePreviewAction,
   save_theme_options: handleSaveThemeOptionsAction,

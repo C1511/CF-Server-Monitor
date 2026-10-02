@@ -28,6 +28,26 @@
           <div><span>{{ trans.lastDecision }}</span><b>{{ aliyunState?.last_decision?.reason || '-' }}</b></div>
         </div>
 
+        <div class="automation-subtitle">{{ trans.thresholdSetting }}</div>
+        <div class="threshold-editor">
+          <input
+            v-model="thresholdInput"
+            type="number"
+            min="1"
+            max="100000"
+            step="1"
+            class="form-input threshold-input"
+            :aria-label="trans.thresholdSetting"
+            @keyup.enter="saveThreshold"
+          />
+          <span class="text-muted">GB</span>
+          <button class="btn btn-primary" :disabled="aliyunBusy || !thresholdChanged" @click="saveThreshold">{{ trans.thresholdSave }}</button>
+          <button class="btn" :disabled="aliyunBusy || aliyun.config.threshold_source !== 'custom'" @click="resetThreshold">{{ trans.thresholdReset }}</button>
+          <span class="text-muted text-sm">{{ thresholdSourceText }}</span>
+        </div>
+        <p class="text-muted text-sm threshold-hint">{{ trans.thresholdApplyHint }}</p>
+        <p v-if="Number(thresholdInput) > 180" class="text-sm threshold-hint text-yellow">⚠ {{ trans.thresholdQuotaHint }}</p>
+
         <template v-if="aliyunState?.cdt">
           <div class="automation-subtitle">CDT</div>
           <div class="automation-kv">
@@ -59,6 +79,49 @@
             <div v-if="aliyunState.ecs.expired_time"><span>Expire</span><b>{{ aliyunState.ecs.expired_time }}</b></div>
           </div>
         </template>
+
+        <div class="automation-subtitle">{{ trans.aliyunBilling }}</div>
+        <div v-if="aliyunState?.billing_error" class="danger-box mb-2">{{ trans.errorLabel }}：{{ aliyunState.billing_error }}</div>
+        <template v-if="billing">
+          <div class="billing-tiles">
+            <div class="billing-tile">
+              <div class="billing-value">{{ money(billing.available_amount) }}</div>
+              <div class="billing-label">{{ trans.accountBalance }}</div>
+            </div>
+            <div class="billing-tile">
+              <div class="billing-value">{{ money(billing.month_pretax_amount) }}</div>
+              <div class="billing-label">{{ trans.monthSpend }} · {{ billing.billing_cycle }}</div>
+            </div>
+            <div class="billing-tile">
+              <div class="billing-value">{{ money(billing.available_cash_amount) }}</div>
+              <div class="billing-label">{{ trans.cashBalance }}</div>
+            </div>
+            <div v-if="billing.month_outstanding_amount" class="billing-tile">
+              <div class="billing-value text-red">{{ money(billing.month_outstanding_amount) }}</div>
+              <div class="billing-label">{{ trans.outstandingAmount }}</div>
+            </div>
+          </div>
+          <table v-if="billing.products?.length" class="automation-table">
+            <thead>
+              <tr>
+                <th>{{ trans.billByProduct }}</th>
+                <th class="num">{{ trans.monthSpend }}</th>
+                <th class="num">{{ trans.monthGross }}</th>
+                <th class="num">{{ trans.couponDeduction }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in billing.products" :key="p.name">
+                <td>{{ p.name }}</td>
+                <td class="num">{{ money(p.pretax_amount) }}</td>
+                <td class="num text-muted">{{ money(p.gross_amount) }}</td>
+                <td class="num text-muted">{{ p.coupon_amount ? money(p.coupon_amount) : '-' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="text-muted text-sm">{{ trans.billingUpdated }} {{ formatDateTime(billing.checked_at) }} · {{ trans.billingHint }}</p>
+        </template>
+        <p v-else-if="!aliyunState?.billing_error" class="text-muted text-sm">{{ trans.billingHint }}</p>
 
         <div class="automation-subtitle">{{ trans.eventLog }}</div>
         <table v-if="aliyunState?.events?.length" class="automation-table">
@@ -137,6 +200,31 @@ const signinLoaded = ref(false)
 const signinBusy = ref(false)
 
 const aliyunState = computed(() => aliyun.value?.state || null)
+const billing = computed(() => aliyunState.value?.billing || null)
+
+const thresholdInput = ref('')
+const thresholdChanged = computed(() => {
+  const n = Number(thresholdInput.value)
+  return thresholdInput.value !== '' && Number.isFinite(n) && n !== Number(aliyun.value?.config?.threshold_gb)
+})
+const thresholdSourceText = computed(() => {
+  const source = aliyun.value?.config?.threshold_source
+  if (source === 'custom') return props.trans.thresholdSourceCustom
+  if (source === 'env') return props.trans.thresholdSourceEnv
+  return props.trans.thresholdSourceDefault
+})
+
+// 服务端数据更新后同步输入框
+watch(() => aliyun.value?.config?.threshold_gb, (value) => {
+  if (value != null) thresholdInput.value = String(value)
+})
+
+const money = (value) => {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '-'
+  const symbol = (billing.value?.currency || 'CNY') === 'CNY' ? '¥' : (billing.value?.currency + ' ')
+  return symbol + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
 
 const signinStatusText = (status) => {
   const key = 'signin' + String(status || 'none').charAt(0).toUpperCase() + String(status || 'none').slice(1)
@@ -151,6 +239,7 @@ const eventClass = (type) => ({
   stop: 'text-yellow',
   warn: 'text-yellow',
   pause: 'text-yellow',
+  config: 'text-cyan',
   error: 'text-red',
   failed: 'text-red'
 }[type] || '')
@@ -158,7 +247,7 @@ const eventClass = (type) => ({
 const call = async (data) => {
   const result = await adminApi(data, props.selectedApiIndex)
   if (result.error) {
-    emit('alert-message', result.error)
+    emit('alert-message', props.trans[result.error] || result.error)
     return null
   }
   return result.data
@@ -179,6 +268,15 @@ const runKeepalive = () => {
   if (window.confirm(props.trans.keepaliveRunConfirm)) {
     aliyunAction('aliyun_run')
   }
+}
+
+const saveThreshold = () => {
+  if (!thresholdChanged.value) return
+  aliyunAction('aliyun_set_threshold', { threshold_gb: Number(thresholdInput.value) })
+}
+
+const resetThreshold = () => {
+  aliyunAction('aliyun_set_threshold', { threshold_gb: null })
 }
 
 const signinAction = async (action) => {
@@ -257,7 +355,53 @@ watch(() => props.activeTab, (tab) => {
   font-weight: 500;
 }
 
+.threshold-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.threshold-input {
+  width: 120px;
+}
+
+.threshold-hint {
+  margin: 6px 0 0;
+}
+
+.billing-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.billing-tile {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+
+.billing-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.billing-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.automation-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .nowrap { white-space: nowrap; }
+.text-cyan { color: var(--accent-cyan); }
 .text-green { color: var(--accent-green); }
 .text-yellow { color: var(--accent-yellow); }
 .text-red { color: var(--accent-red); }

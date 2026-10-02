@@ -442,7 +442,7 @@ export default {
           loadSigninState(env.DB)
         ]);
         return createSuccessResponse({
-          aliyun: buildPublicView(env, aliyunState),
+          aliyun: buildPublicView(env, aliyunState, { includeBilling: isLoggedIn }),
           signin: buildSigninPublicView(env, signinState)
         });
       }},

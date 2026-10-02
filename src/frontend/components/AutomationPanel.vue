@@ -22,6 +22,10 @@
           <span>{{ trans.lastCheck }} {{ formatShortTime(aliyun.checked_at) }}</span>
           <span v-if="aliyun.last_action">{{ trans.lastAction }} {{ aliyun.last_action.type === 'start' ? trans.actionStart : trans.actionStop }} {{ formatShortTime(aliyun.last_action.at) }}</span>
         </div>
+        <div v-if="aliyun.billing" class="automation-billing">
+          <span>{{ trans.monthSpend }} <b>{{ formatMoney(aliyun.billing.month_pretax_amount, aliyun.billing.currency) }}</b></span>
+          <span>{{ trans.accountBalance }} <b>{{ formatMoney(aliyun.billing.available_amount, aliyun.billing.currency) }}</b></span>
+        </div>
         <div class="automation-hint">{{ trans.cdtResetHint }}</div>
       </template>
       <div v-else class="automation-hint">{{ trans.waitingFirstCheck }}</div>
@@ -122,6 +126,13 @@ const formatMemory = (mb) => {
   const n = Number(mb)
   if (!Number.isFinite(n) || n <= 0) return '-'
   return n >= 1024 ? `${Math.round((n / 1024) * 10) / 10}G` : `${n}M`
+}
+
+const formatMoney = (value, currency = 'CNY') => {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '-'
+  const symbol = currency === 'CNY' ? '¥' : `${currency} `
+  return symbol + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 const formatShortTime = (ts) => {
@@ -237,6 +248,22 @@ onUnmounted(() => {
   margin-top: 8px;
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.automation-billing {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.automation-billing b {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
 }
 
 .automation-hint {
