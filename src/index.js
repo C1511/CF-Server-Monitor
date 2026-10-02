@@ -10,6 +10,8 @@ import { handleGithubOAuthCallback, handleGithubOAuthStartApi, isGithubOAuthRead
 import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOptions, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, saveThemeOptions, setDebug, debug } from './utils/settings.js';
 import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
+import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
+import { buildSigninPublicView, loadSigninState, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
@@ -428,6 +430,22 @@ export default {
         return handleServersAPI(request, env, sys);
       }},
       { method: 'GET', path: '/api/ws', handler: async () => handleWebSocketUpgrade(request, env) },
+      { method: 'GET', path: '/api/automation', handler: async () => {
+        // 自动任务摘要（阿里云保活、NodeSeek 签到），可见性与服务器列表一致
+        await ensureSiteSettings();
+        const isLoggedIn = await checkAuth(request, env, sys);
+        if (sys.is_public !== 'true' && !isLoggedIn) {
+          return simpleAuthResponse();
+        }
+        const [aliyunState, signinState] = await Promise.all([
+          loadKeepaliveState(env.DB),
+          loadSigninState(env.DB)
+        ]);
+        return createSuccessResponse({
+          aliyun: buildPublicView(env, aliyunState),
+          signin: buildSigninPublicView(env, signinState)
+        });
+      }},
 
       { method: 'GET', path: '/api/history/all', handler: async () => {
         await ensureSiteSettings();
@@ -488,6 +506,10 @@ export default {
     const minute = now.getUTCMinutes();
     
     if (cron === '*/1 * * * *') {
+      // 阿里云保活按自身间隔执行，不受表轮换窗口影响
+      ctx.waitUntil(runAliyunKeepaliveIfDue(env).catch(e => console.error('[Cron] 阿里云保活失败:', e)));
+      ctx.waitUntil(runNodeseekSigninIfDue(env).catch(e => console.error('[Cron] NodeSeek 签到失败:', e)));
+
       if (day === 0 && hour === 0 && minute < 5) {
         debug('[Cron] 每周日0:00-0:05表轮换期间，跳过离线节点检测');
       } else {

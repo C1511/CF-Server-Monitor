@@ -467,3 +467,10 @@ export const clearHistory = async (apiIndex = 0) => {
 }
 
 export { isAdminLoggedIn }
+
+// 自动任务摘要（阿里云保活 / NodeSeek 签到）；未配置或无权限时返回 null
+export const fetchAutomation = async (apiIndex = 0) => {
+  const result = await http.getByIndex('/api/automation', apiIndex, { includeAuth: true, autoRedirect: false })
+  if (result.error || !result.data) return null
+  return result.data
+}

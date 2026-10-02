@@ -254,6 +254,24 @@ docker rm -f cf-probe && docker volume rm cf-probe-data
 | `API_BASE`             | 否  | 前端请求的 Worker API 地址，多个用英文逗号分隔；用于多 Worker 聚合或前后端分离 |
 | `CORS_ALLOWED_ORIGINS` | 否  | 允许跨域访问 API 的来源，多个用英文逗号分隔 |
 
+### 自动任务（阿里云保活 / NodeSeek 签到）
+
+两项任务都复用每分钟的 Cron，状态保存在 D1，展示在首页和后台「自动任务」标签页。未配置对应变量时自动关闭、面板不显示。
+通过 GitHub Actions 部署时，在仓库 Secrets 中添加同名项即可；带 🔐 的会作为加密 Secret 上传，其余写入 `[vars]`。
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| 🔐 `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` | 启用保活时必填 | 建议使用仅有 `ecs:DescribeInstances`、`ecs:StartInstances`、`ecs:StopInstances`、`cdt:ListCdtInternetTraffic` 权限的 RAM 子账号 |
+| `ALIYUN_ECS_INSTANCE_ID` | 启用保活时必填 | 要保活的 ECS 实例 ID |
+| `ALIYUN_REGION_ID` | 否 | 默认 `cn-hongkong` |
+| `ALIYUN_CDT_THRESHOLD_GB` | 否 | 非内地 CDT 流量阈值，默认 `180`；低于阈值开机，达到阈值关机 |
+| `ALIYUN_CHECK_INTERVAL_MINUTES` | 否 | 检查间隔（1-60 分钟），默认 `10` |
+| 🔐 `NS_COOKIE` | 启用签到时必填 | NodeSeek 登录 Cookie 整串 |
+| `NS_SIGNIN_TIME` | 否 | 每日签到时间（北京时间 `HH:MM`），默认 `08:37`；失败每 30 分钟重试，每天最多 3 次 |
+| `NS_SIGNIN_RANDOM` | 否 | 是否使用「试试手气」，默认 `true` |
+
+开关机、CDT 达到 90%、检查失败、签到失败会通过后台已配置的通知渠道（Telegram / Webhook / 邮件）推送。
+
 ### GitHub Pages 静态前台
 
 项目支持把前台构建到 GitHub Pages，并通过远程 Worker API 聚合数据。相关工作流为 `.github/workflows/deploy-github-page.yml`。
