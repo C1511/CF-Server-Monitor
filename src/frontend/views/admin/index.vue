@@ -1257,15 +1257,10 @@ const handleLogin = async () => {
 
   const result = await login(loginForm.value.username, loginForm.value.password, turnstileToken.value, selectedApiIndex.value)
   if (!result.error) {
-    isLoggedIn.value = true
-    syncApiIndexQuery()
     clearTurnstile()
-    turnstileVerified.value = hasSharedTurnstileVerified()
-    await Promise.all([
-      loadSettings(),
-      loadServers(),
-      loadLatestAgentVersion()
-    ])
+    // 登录成功后默认进入首页面板（整页跳转，让首页重新读取登录状态）
+    window.location.href = '/'
+    return
   } else {
     loginError.value = result.status === 403 ? 'Please complete the verification' : trans.value.errorInvalidUsername
     loginForm.value.password = ''

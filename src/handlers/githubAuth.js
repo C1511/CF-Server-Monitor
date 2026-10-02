@@ -215,7 +215,8 @@ export async function handleGithubOAuthCallback(request, env, settings) {
     }
 
     const token = await generateToken(env, settings);
-    return redirectToAdmin(request, '', [
+    // GitHub 登录成功后默认进入首页面板
+    return redirectResponse(new URL('/', request.url).toString(), [
       buildAuthCookie(request, token),
       clearStateCookie
     ]);

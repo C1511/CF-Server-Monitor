@@ -72,7 +72,7 @@ test('GitHub OAuth callback issues the existing auth cookie without a database l
     const response = await handleGithubOAuthCallback(callbackRequest, {}, oauthSettings);
 
     assert.equal(response.status, 302);
-    assert.equal(response.headers.get('Location'), 'https://monitor.example/admin');
+    assert.equal(response.headers.get('Location'), 'https://monitor.example/');
     assert.equal(calls.length, 2);
     assert.match(calls[0].options.body, /client_secret=client-secret/);
 
