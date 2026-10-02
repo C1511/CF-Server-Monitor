@@ -603,7 +603,9 @@ test('billing sends the RegionId matching each site and reports every site tried
   });
   try {
     const state = await runAliyunKeepalive(aliyunEnv(), { now: 1000, forceBilling: true });
-    assert.match(state.billing_error, /已尝试：business\.aliyuncs\.com、business\.ap-southeast-1\.aliyuncs\.com/);
+    assert.match(state.billing_error, /\[business\.aliyuncs\.com\] QueryAccountBalance .*AuthSiteFail/);
+    assert.match(state.billing_error, /\[business\.ap-southeast-1\.aliyuncs\.com\] QueryAccountBalance .*AuthSiteFail/);
+    assert.ok(state.billing_error_at, 'error timestamp recorded');
   } finally {
     f.restore();
   }
@@ -750,4 +752,24 @@ test('refreshed cookie from the relay is stored only when the check-in succeeds'
   env = await relayEnv();
   await reportRelayResult(env, 'srv-hk', '200', '{"success":true,"message":"ok"}', AFTER_SCHEDULE, { refreshedCookie: 'bad\r\ncookie' });
   assert.equal((await resolveSigninConfig(env)).cookieSource, 'env', 'invalid cookie ignored');
+});
+
+test('billing still shows the balance when only the bill overview fails', async () => {
+  const handler = aliyunHandler({ trafficGB: 10, status: 'Running' });
+  const f = mockFetch((u, init) => {
+    if (u.searchParams.get('Action') === 'QueryBillOverview') {
+      return Response.json({ Code: 'InternalError', Message: 'boom' }, { status: 500 });
+    }
+    return handler(u, init);
+  });
+  try {
+    const env = aliyunEnv();
+    const state = await runAliyunKeepalive(env, { now: 1000, forceBilling: true });
+    assert.equal(state.billing.available_amount, 1234.5);
+    assert.equal(state.billing.month_pretax_amount, null);
+    assert.match(state.billing_error, /\[business\.aliyuncs\.com\] QueryBillOverview .*InternalError/);
+    assert.equal(buildPublicView(env, state, { includeBilling: true }).billing.available_amount, 1234.5);
+  } finally {
+    f.restore();
+  }
 });

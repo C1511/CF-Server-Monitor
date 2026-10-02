@@ -81,7 +81,9 @@
         </template>
 
         <div class="automation-subtitle">{{ trans.aliyunBilling }}</div>
-        <div v-if="aliyunState?.billing_error" class="danger-box mb-2">{{ trans.errorLabel }}：{{ aliyunState.billing_error }}</div>
+        <div v-if="aliyunState?.billing_error" class="danger-box mb-2">
+          {{ trans.errorLabel }}<template v-if="aliyunState.billing_error_at">（{{ formatDateTime(aliyunState.billing_error_at) }}）</template>：{{ aliyunState.billing_error }}
+        </div>
         <template v-if="billing">
           <div class="billing-tiles">
             <div class="billing-tile">

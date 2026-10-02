@@ -259,29 +259,48 @@ function bssEndpointCandidates(config, preferred) {
   return [...new Set([preferred, BSS_ENDPOINT_CN, BSS_ENDPOINT_INTL].filter(Boolean))];
 }
 
+const EMPTY_OVERVIEW = Object.freeze({
+  month_pretax_amount: null,
+  month_gross_amount: null,
+  month_outstanding_amount: null,
+  products: []
+});
+
+/**
+ * 查询账单：先用余额接口确定账号所属站点，再查本月账单概览。
+ * 账单概览失败时仍返回余额（overview_error 说明原因）；每条错误都标注站点，便于排查。
+ */
 async function fetchBilling(config, now, preferredEndpoint) {
   const billingCycle = beijingMonth(now);
   const candidates = bssEndpointCandidates(config, preferredEndpoint);
-  let lastError = null;
+  const errors = [];
+  let partial = null;
+
   for (const endpoint of candidates) {
+    let balance;
     try {
-      const [balance, overview] = await Promise.all([
-        callBss(config, 'QueryAccountBalance', {}, endpoint),
-        callBss(config, 'QueryBillOverview', { BillingCycle: billingCycle }, endpoint)
-      ]);
-      return {
-        checked_at: now,
-        billing_cycle: billingCycle,
-        endpoint,
-        ...summarizeAccountBalance(balance),
-        ...summarizeBillOverview(overview)
-      };
+      balance = await callBss(config, 'QueryAccountBalance', {}, endpoint);
     } catch (e) {
-      lastError = e;
-      if (!isAuthSiteError(e)) throw e;
+      errors.push(`[${endpoint}] ${e?.message || e}`);
+      if (!isAuthSiteError(e)) break;
+      continue;
+    }
+
+    const base = { checked_at: now, billing_cycle: billingCycle, endpoint, ...summarizeAccountBalance(balance) };
+    try {
+      const overview = await callBss(config, 'QueryBillOverview', { BillingCycle: billingCycle }, endpoint);
+      return { ...base, ...summarizeBillOverview(overview), overview_error: '' };
+    } catch (e) {
+      const message = `[${endpoint}] ${e?.message || e}`;
+      errors.push(message);
+      partial = partial || { ...base, ...EMPTY_OVERVIEW, overview_error: message };
+      // 余额能查但账单概览提示站点不符：继续尝试另一个站点
+      if (!isAuthSiteError(e)) break;
     }
   }
-  throw new Error(`${lastError?.message || lastError}（已尝试：${candidates.join('、')}）`);
+
+  if (partial) return partial;
+  throw new Error(errors.join('；') || '账单查询失败');
 }
 
 async function fetchCdtTraffic(config) {
@@ -431,11 +450,12 @@ export async function runAliyunKeepalive(env, { apply = true, trigger = 'cron', 
     state.billing_attempted_at = now;
     try {
       state.billing = await fetchBilling(config, now, state.billing?.endpoint);
-      state.billing_error = '';
+      state.billing_error = state.billing.overview_error || '';
     } catch (e) {
       state.billing_error = e?.message || String(e);
       console.error('[aliyun] 账单查询失败:', state.billing_error);
     }
+    state.billing_error_at = state.billing_error ? now : null;
   }
 
   await saveKeepaliveState(env.DB, state);
