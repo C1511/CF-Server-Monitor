@@ -13,7 +13,7 @@ import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, n
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
 import { deriveAgentSecret } from '../utils/agentSecret.js';
 import { buildAdminView, loadKeepaliveState, resolveAliyunConfig, runAliyunKeepalive, setAliyunKeepalivePaused, setAliyunThreshold } from '../services/aliyunKeepalive.js';
-import { buildSigninAdminView, loadSigninState, resolveSigninConfig, runNodeseekSignin, setSigninCookie } from '../services/nodeseekSignin.js';
+import { buildSigninAdminView, loadSigninState, resolveSigninConfig, runNodeseekSignin, setSigninCookie, setSigninRelay } from '../services/nodeseekSignin.js';
 import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
@@ -807,6 +807,21 @@ async function handleSigninRunAction({ env }) {
   return signinAdminResponse(env, await runNodeseekSignin(env, { trigger: 'manual' }));
 }
 
+// 指定签到代发服务器（需为已添加的服务器）；传空值关闭代发模式
+async function handleSigninSetRelayAction({ env, data }) {
+  const serverId = String(data.server_id || '').trim();
+  if (serverId) {
+    const exists = await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(serverId).first();
+    if (!exists) return createBadRequestResponse('invalidServerId');
+  }
+  try {
+    return signinAdminResponse(env, await setSigninRelay(env, serverId || null));
+  } catch (e) {
+    if (e?.message === 'invalidServerId') return createBadRequestResponse('invalidServerId');
+    throw e;
+  }
+}
+
 // Cookie 只写不读：响应中不会返回 Cookie 内容
 async function handleSigninSetCookieAction({ env, data }) {
   try {
@@ -824,6 +839,7 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   signin_check: handleSigninCheckAction,
   signin_run: handleSigninRunAction,
   signin_set_cookie: handleSigninSetCookieAction,
+  signin_set_relay: handleSigninSetRelayAction,
   aliyun_status: handleAliyunStatusAction,
   aliyun_refresh: handleAliyunRefreshAction,
   aliyun_run: handleAliyunRunAction,

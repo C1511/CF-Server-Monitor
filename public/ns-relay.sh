@@ -1,0 +1,276 @@
+#!/bin/sh
+# CF-Server-Monitor NodeSeek 签到代发脚本
+#
+# NodeSeek 已关闭 IPv6 访问，而 Cloudflare Workers 只能以 IPv6 发出请求，
+# 因此由一台有 IPv4 的服务器在签到时间向面板领取任务、发起签到，并把原始响应回传给面板。
+# Cookie 保存在面板后台（加密），本脚本每次运行时临时领取，不落盘。
+#
+# 安装（以普通用户运行即可，无需 root）：
+#   curl -fsSL https://面板地址/ns-relay.sh | CFSM_RELAY_SECRET='该服务器的上报密钥' sh -s -- install --url=https://面板地址 --id=服务器ID --time=08:37
+# 其他命令：
+#   cfsm-ns-relay run [--force]   立即执行（--force 忽略签到时间，但不会重复签到）
+#   cfsm-ns-relay check           只检查与面板的连接和今日任务，不签到
+#   cfsm-ns-relay uninstall       卸载
+
+set -u
+umask 077
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cfsm-ns-relay"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_FILE="$CONFIG_DIR/relay.log"
+LOCK_DIR="$CONFIG_DIR/run.lock"
+BIN_DIR="$HOME/.local/bin"
+BIN_FILE="$BIN_DIR/cfsm-ns-relay"
+CRON_TAG="# cfsm-ns-relay"
+NS_ORIGIN="${CFSM_NS_ORIGIN:-https://www.nodeseek.com}"
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+MAX_ATTEMPTS=3
+RETRY_SLEEP_SECONDS="${CFSM_RETRY_SLEEP:-600}"
+
+log() {
+    line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+    printf '%s\n' "$line"
+    if [ -d "$CONFIG_DIR" ]; then
+        printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+die() {
+    log "[ERROR] $*"
+    exit 1
+}
+
+trim_log() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -n 200 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    fi
+}
+
+# curl 配置文件格式的双引号字符串转义
+curl_quote() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# 从 key=value 文本中取值
+field() {
+    printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -n 1
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || die "未安装：找不到 $CONFIG_FILE"
+    RELAY_URL="$(sed -n 's/^URL=//p' "$CONFIG_FILE")"
+    RELAY_ID="$(sed -n 's/^ID=//p' "$CONFIG_FILE")"
+    RELAY_SECRET="$(sed -n 's/^SECRET=//p' "$CONFIG_FILE")"
+    [ -n "$RELAY_URL" ] && [ -n "$RELAY_ID" ] && [ -n "$RELAY_SECRET" ] || die "配置不完整：$CONFIG_FILE"
+}
+
+# 向面板发请求；鉴权头通过 stdin 传给 curl，不出现在进程参数中
+# 用法：panel_request <path> [body_file]
+panel_request() {
+    path="$1"
+    body_file="${2:-}"
+    {
+        printf 'url = "%s%s"\n' "$RELAY_URL" "$path"
+        printf 'header = "X-Relay-Id: %s"\n' "$RELAY_ID"
+        printf 'header = "X-Relay-Secret: %s"\n' "$RELAY_SECRET"
+        if [ -n "${RELAY_STATUS:-}" ]; then
+            printf 'header = "X-Relay-Status: %s"\n' "$RELAY_STATUS"
+        fi
+        printf 'header = "Content-Type: text/plain; charset=utf-8"\n'
+        if [ -z "$body_file" ]; then
+            printf 'data = ""\n'
+        fi
+    } | if [ -n "$body_file" ]; then
+        # 请求体文件路径不含敏感信息，作为普通参数传入
+        curl -sS -m 30 --connect-timeout 10 -K - --data-binary "@$body_file"
+    else
+        curl -sS -m 30 --connect-timeout 10 -K -
+    fi
+}
+
+fetch_task() {
+    force_query=""
+    [ "${1:-}" = "force" ] && force_query="?force=1"
+    RELAY_STATUS="" panel_request "/relay/nodeseek/task$force_query"
+}
+
+do_signin() {
+    cookie="$1"
+    random="$2"
+    body_file="$3"
+    {
+        printf 'url = "%s/api/attendance?random=%s"\n' "$NS_ORIGIN" "$random"
+        printf 'header = "Cookie: %s"\n' "$(curl_quote "$cookie")"
+        printf 'header = "User-Agent: %s"\n' "$USER_AGENT"
+        printf 'header = "Accept: application/json, text/plain, */*"\n'
+        printf 'header = "Accept-Language: zh-CN,zh;q=0.9"\n'
+        printf 'header = "Origin: %s"\n' "$NS_ORIGIN"
+        printf 'header = "Referer: %s/board"\n' "$NS_ORIGIN"
+        printf 'data = ""\n'
+    } | curl -4 -sS -m 30 --connect-timeout 10 -o "$body_file" -w '%{http_code}' -K - 2>"$body_file.err"
+}
+
+cmd_run() {
+    load_config
+    mkdir "$LOCK_DIR" 2>/dev/null || die "已有任务在运行（如确认没有，可删除 $LOCK_DIR）"
+    tmp_body="$(mktemp "${TMPDIR:-/tmp}/cfsm-ns.XXXXXX")" || { rmdir "$LOCK_DIR"; die "无法创建临时文件"; }
+    trap 'rm -f "$tmp_body" "$tmp_body.err" "$tmp_body.report"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+
+    mode="${1:-}"
+    attempt=1
+    while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+        task="$(fetch_task "$mode")" || die "无法连接面板 $RELAY_URL"
+        if [ -n "$(field error "$task")" ]; then
+            die "面板拒绝请求：$(field error "$task")（检查服务器 ID 与密钥，或后台是否已选择本机为代发服务器）"
+        fi
+        if [ "$(field due "$task")" != "true" ]; then
+            log "无需签到：$(field reason "$task")"
+            trim_log
+            return 0
+        fi
+
+        cookie="$(field cookie "$task")"
+        random="$(field random "$task")"
+        [ "$random" = "false" ] || random="true"
+        log "第 ${attempt} 次签到（IPv4）..."
+        code="$(do_signin "$cookie" "$random" "$tmp_body")" || code="000"
+        cookie=""
+
+        if [ "$code" = "000" ]; then
+            head -c 300 "$tmp_body.err" > "$tmp_body.report" 2>/dev/null
+            RELAY_STATUS="0"
+        else
+            head -c 65536 "$tmp_body" > "$tmp_body.report" 2>/dev/null
+            RELAY_STATUS="$code"
+        fi
+        result="$(panel_request "/relay/nodeseek/report" "$tmp_body.report")" || die "签到已发出，但回传结果到面板失败"
+        RELAY_STATUS=""
+        log "结果：$(field kind "$result") $(field message "$result")"
+
+        if [ "$(field done "$result")" = "1" ]; then
+            trim_log
+            return 0
+        fi
+        if [ "$(field retry "$result")" != "1" ]; then
+            trim_log
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -le "$MAX_ATTEMPTS" ]; then
+            log "${RETRY_SLEEP_SECONDS} 秒后重试"
+            sleep "$RETRY_SLEEP_SECONDS"
+            mode=""
+        fi
+    done
+    trim_log
+    return 1
+}
+
+cmd_check() {
+    load_config
+    task="$(fetch_task)" || die "无法连接面板 $RELAY_URL"
+    if [ -n "$(field error "$task")" ]; then
+        die "面板拒绝请求：$(field error "$task")"
+    fi
+    log "面板连接正常。今日任务：due=$(field due "$task") $(field reason "$task")"
+    if command -v curl >/dev/null 2>&1; then
+        ns_code="$(curl -4 -sS -o /dev/null -m 15 -w '%{http_code}' "$NS_ORIGIN/" 2>/dev/null || echo 000)"
+        log "本机 IPv4 访问 NodeSeek：HTTP $ns_code"
+    fi
+}
+
+# 北京时间 HH:MM 转为本机时区的 crontab 分、时
+local_cron_time() {
+    bj_hour="${1%%:*}"
+    bj_min="${1##*:}"
+    offset="$(date +%z)"
+    sign="$(printf '%s' "$offset" | cut -c1)"
+    off_h="$(printf '%s' "$offset" | cut -c2-3 | sed 's/^0//')"
+    off_m="$(printf '%s' "$offset" | cut -c4-5 | sed 's/^0//')"
+    off_total=$(( ${off_h:-0} * 60 + ${off_m:-0} ))
+    [ "$sign" = "-" ] && off_total=$(( -off_total ))
+    bj_total=$(( $(printf '%s' "$bj_hour" | sed 's/^0//' | sed 's/^$/0/') * 60 + $(printf '%s' "$bj_min" | sed 's/^0//' | sed 's/^$/0/') ))
+    total=$(( (bj_total - 480 + off_total + 1440 * 2) % 1440 ))
+    printf '%s %s' "$((total % 60))" "$((total / 60))"
+}
+
+cmd_install() {
+    url=""
+    id=""
+    time="08:37"
+    for arg in "$@"; do
+        case "$arg" in
+            --url=*) url="${arg#*=}" ;;
+            --id=*) id="${arg#*=}" ;;
+            --time=*) time="${arg#*=}" ;;
+        esac
+    done
+    secret="${CFSM_RELAY_SECRET:-}"
+
+    url="${url%/}"
+    case "$url" in
+        https://*) ;;
+        *) die "--url 必须是 https:// 开头的面板地址" ;;
+    esac
+    printf '%s' "$url" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?$' || die "--url 只能是面板根地址，例如 https://board.example.com"
+    printf '%s' "$id" | grep -Eq '^[A-Za-z0-9_-]{1,64}$' || die "--id 无效"
+    printf '%s' "$secret" | grep -Eq '^[0-9a-fA-F]{32,128}$' || die "请通过环境变量 CFSM_RELAY_SECRET 提供该服务器的上报密钥"
+    printf '%s' "$time" | grep -Eq '^([01]?[0-9]|2[0-3]):[0-5][0-9]$' || die "--time 格式应为 HH:MM（北京时间）"
+    command -v curl >/dev/null 2>&1 || die "需要 curl"
+    command -v crontab >/dev/null 2>&1 || die "需要 crontab（cron 服务）"
+
+    mkdir -p "$CONFIG_DIR" "$BIN_DIR" || die "无法创建目录"
+    chmod 700 "$CONFIG_DIR"
+    {
+        printf 'URL=%s\n' "$url"
+        printf 'ID=%s\n' "$id"
+        printf 'SECRET=%s\n' "$secret"
+    } > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+
+    curl -fsSL -m 60 "$url/ns-relay.sh" -o "$BIN_FILE.tmp" || die "下载脚本失败：$url/ns-relay.sh"
+    mv "$BIN_FILE.tmp" "$BIN_FILE"
+    chmod 700 "$BIN_FILE"
+
+    set -- $(local_cron_time "$time")
+    cron_line="$1 $2 * * * \"$BIN_FILE\" run >/dev/null 2>&1 $CRON_TAG"
+    { crontab -l 2>/dev/null | grep -v "$CRON_TAG"; printf '%s\n' "$cron_line"; } | crontab - || die "写入 crontab 失败"
+
+    log "已安装：每天北京时间 $time 执行（本机时间 $(printf '%02d:%02d' "$2" "$1")）"
+    log "脚本：$BIN_FILE   配置：$CONFIG_FILE   日志：$LOG_FILE"
+    RELAY_URL="$url" RELAY_ID="$id" RELAY_SECRET="$secret" cmd_check_inline
+}
+
+# 安装后立即检查一次（复用已解析的参数）
+cmd_check_inline() {
+    task="$(RELAY_STATUS="" panel_request "/relay/nodeseek/task")" || { log "[WARN] 暂时无法连接面板"; return 0; }
+    if [ -n "$(field error "$task")" ]; then
+        log "[WARN] 面板拒绝请求：$(field error "$task")（请确认后台已选择本机为代发服务器）"
+    else
+        log "面板连接正常。今日任务：due=$(field due "$task") $(field reason "$task")"
+    fi
+}
+
+cmd_uninstall() {
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab - 2>/dev/null || true
+    fi
+    rm -f "$BIN_FILE"
+    rm -rf "$CONFIG_DIR"
+    printf '已卸载 cfsm-ns-relay\n'
+}
+
+case "${1:-}" in
+    install) shift; cmd_install "$@" ;;
+    run)
+        shift
+        if [ "${1:-}" = "--force" ]; then cmd_run force; else cmd_run; fi
+        ;;
+    check) cmd_check ;;
+    uninstall) cmd_uninstall ;;
+    *)
+        printf '用法：%s install|run [--force]|check|uninstall\n' "$0"
+        exit 1
+        ;;
+esac

@@ -145,10 +145,11 @@
       <div v-if="signinLoaded && !signin?.enabled" class="warning-box">{{ trans.notConfiguredSignin }}</div>
 
       <template v-if="signin?.enabled">
-        <div class="automation-actions">
+        <div v-if="!relayActive" class="automation-actions">
           <button class="btn" :disabled="signinBusy" @click="signinAction('signin_check')">🔍 {{ trans.signinCheck }}</button>
           <button class="btn btn-primary" :disabled="signinBusy" @click="signinAction('signin_run')">✔ {{ trans.signinRunNow }}</button>
         </div>
+        <p v-else class="text-sm relay-manual"><code>{{ trans.signinRelayManual }}</code></p>
 
         <div v-if="signin.error" class="danger-box mb-2">
           <div v-if="signin.failure_kind === 'cookie_invalid'"><b>{{ trans.signinCookieInvalid }}</b></div>
@@ -180,6 +181,28 @@
       </template>
 
       <template v-if="signinLoaded && signin?.config">
+        <div class="automation-subtitle">{{ trans.signinRelayTitle }}</div>
+        <p class="text-muted text-sm relay-desc">{{ trans.signinRelayDesc }}</p>
+        <div class="threshold-editor">
+          <select v-model="relaySelect" class="form-input relay-select" :aria-label="trans.signinRelayTitle">
+            <option value="">{{ trans.signinRelayNone }}</option>
+            <option v-for="s in relayServers" :key="s.id" :value="s.id">{{ s.name || s.id }}</option>
+          </select>
+          <button class="btn btn-primary" :disabled="signinBusy || relaySelect === (signin.config.relay_server_id || '')" @click="saveRelay">{{ trans.signinRelaySave }}</button>
+        </div>
+        <template v-if="relayActive">
+          <div class="automation-kv relay-status">
+            <div><span>{{ trans.signinRelaySeen }}</span><b>{{ signin.relay_seen_at ? formatDateTime(signin.relay_seen_at) : trans.signinRelayNever }}</b></div>
+            <div><span>{{ trans.signinRelayReported }}</span><b>{{ signin.relay_reported_at ? formatDateTime(signin.relay_reported_at) : trans.signinRelayNever }}</b></div>
+          </div>
+          <p class="text-sm relay-install-label">{{ trans.signinRelayInstall }}</p>
+          <div class="relay-command">
+            <code>{{ relayCommand || '…' }}</code>
+            <button class="btn" :disabled="!relayCommand" @click="copyRelayCommand">{{ relayCopied ? trans.copied : trans.copyCommand }}</button>
+          </div>
+          <p class="text-muted text-sm">{{ trans.signinRelayInstallHint }}</p>
+        </template>
+
         <div class="automation-subtitle">{{ trans.signinCookieTitle }}</div>
         <div v-if="signin.config.stored_cookie_unreadable" class="warning-box mb-2">{{ trans.signinCookieUnreadable }}</div>
         <div class="automation-kv mb-2">
@@ -214,6 +237,7 @@
 import { computed, ref, watch } from 'vue'
 import { adminApi } from '../../../utils/api'
 import { formatDateTime } from '../../../utils/time.js'
+import { copyTextToClipboard } from '../../../utils/clipboard.js'
 
 const props = defineProps({
   trans: { type: Object, required: true },
@@ -301,6 +325,42 @@ const runKeepalive = () => {
   }
 }
 
+// ---- 签到代发服务器 ----
+const relayServers = ref([])
+const relaySelect = ref('')
+const relayCopied = ref(false)
+const relayActive = computed(() => Boolean(signin.value?.config?.relay_server_id))
+
+watch(() => signin.value?.config?.relay_server_id, (value) => {
+  relaySelect.value = value || ''
+})
+
+// 安装命令：密钥通过环境变量传给 sh，不出现在 install 的参数中
+const relayCommand = computed(() => {
+  const id = signin.value?.config?.relay_server_id
+  const server = relayServers.value.find(s => s.id === id)
+  if (!server?.agent_secret) return ''
+  const origin = window.location.origin
+  const time = signin.value?.schedule || '08:37'
+  return `curl -fsSL ${origin}/ns-relay.sh | CFSM_RELAY_SECRET='${server.agent_secret}' sh -s -- install --url=${origin} --id=${id} --time=${time}`
+})
+
+const loadRelayServers = async () => {
+  const data = await call({ action: 'list' })
+  if (data?.servers) relayServers.value = data.servers
+}
+
+const saveRelay = () => {
+  signinAction('signin_set_relay', { server_id: relaySelect.value || null })
+}
+
+const copyRelayCommand = async () => {
+  if (await copyTextToClipboard(relayCommand.value)) {
+    relayCopied.value = true
+    setTimeout(() => { relayCopied.value = false }, 2000)
+  }
+}
+
 const cookieInput = ref('')
 const cookieSaved = ref(false)
 
@@ -352,6 +412,7 @@ watch(() => props.activeTab, (tab) => {
   if (tab === 'automation') {
     aliyunAction('aliyun_status')
     signinAction('signin_status')
+    loadRelayServers()
   }
 }, { immediate: true })
 </script>
@@ -411,6 +472,51 @@ watch(() => props.activeTab, (tab) => {
 .automation-table th {
   color: var(--text-secondary);
   font-weight: 500;
+}
+
+.relay-desc {
+  margin: 0 0 8px;
+}
+
+.relay-select {
+  min-width: 220px;
+  max-width: 100%;
+}
+
+.relay-status {
+  margin-top: 10px;
+}
+
+.relay-install-label {
+  margin: 10px 0 4px;
+  color: var(--text-secondary);
+}
+
+.relay-command {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.relay-command code,
+.relay-manual code {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.relay-manual {
+  margin: 0 0 12px;
+}
+
+.relay-manual code {
+  display: inline-block;
 }
 
 .cookie-input {

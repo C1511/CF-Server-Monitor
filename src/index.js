@@ -11,7 +11,8 @@ import { isValidThemeOptions, loadSettings, loadSiteSettings, loadAppearanceOpti
 import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
-import { buildSigninPublicView, loadSigninState, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
+import { buildSigninPublicView, formatRelayText, getRelayTask, loadSigninState, reportRelayResult, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
+import { verifyAgentSecret } from './utils/agentSecret.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
@@ -102,6 +103,21 @@ async function isTurnstileVerified(request, env, sys) {
   } catch {
     return false;
   }
+}
+
+function relayTextResponse(fields, status = 200) {
+  return new Response(formatRelayText(fields), {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+}
+
+// 签到代发服务器鉴权：使用该服务器自己的上报密钥（放在请求头中，不出现在 URL 里）
+async function authenticateRelay(request, env) {
+  const id = String(request.headers.get('X-Relay-Id') || '').trim();
+  const secret = String(request.headers.get('X-Relay-Secret') || '').trim();
+  if (!id || !await verifyAgentSecret(env, id, secret)) return null;
+  return id;
 }
 
 async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
@@ -281,6 +297,19 @@ export default {
 
     const routes = [
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
+      { method: 'POST', path: '/relay/nodeseek/task', handler: async () => {
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const task = await getRelayTask(env, serverId, { force: url.searchParams.get('force') === '1' });
+        return relayTextResponse(task);
+      }},
+      { method: 'POST', path: '/relay/nodeseek/report', handler: async () => {
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const body = await request.text();
+        const result = await reportRelayResult(env, serverId, request.headers.get('X-Relay-Status'), body);
+        return relayTextResponse({ done: result.done ? 1 : 0, retry: result.retry ? 1 : 0, kind: result.kind, message: result.message });
+      }},
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {
         await ensureSiteSettings();

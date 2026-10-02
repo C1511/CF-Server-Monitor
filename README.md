@@ -273,6 +273,12 @@ docker rm -f cf-probe && docker volume rm cf-probe-data
 
 开关机、CDT 达到 90%、检查失败、签到失败会通过后台已配置的通知渠道（Telegram / Webhook / 邮件）推送。
 
+**NodeSeek 签到代发**：NodeSeek 已关闭 IPv6 访问，而 Cloudflare Workers 只能用 IPv6 发起请求，因此需要一台有 IPv4 的服务器代发。
+在后台「自动任务」→「代发服务器」中选择一台已添加的服务器，按页面给出的命令在该服务器上以普通用户安装 `ns-relay.sh`。
+它只在签到时间由 crontab 触发一次，向面板领取任务、用 IPv4 发起签到并回传结果；失败最多重试 3 次（Cookie 失效不重试）。
+Cookie 仍加密保存在面板（可在后台随时更新），鉴权使用该服务器自己的上报密钥。NodeSeek 登录需要人机验证，因此不支持账号密码自动登录。
+
+
 ### GitHub Pages 静态前台
 
 项目支持把前台构建到 GitHub Pages，并通过远程 Worker API 聚合数据。相关工作流为 `.github/workflows/deploy-github-page.yml`。

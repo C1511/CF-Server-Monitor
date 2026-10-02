@@ -7,6 +7,10 @@
  *   1. 后台「自动任务」中粘贴的 Cookie（AES-GCM 加密后存入 D1，密钥由 API_SECRET 派生）
  *   2. 环境变量 NS_COOKIE（加密 Secret）
  *
+ * 代发模式：NodeSeek 已关闭 IPv6 访问，而 Workers 只能以 IPv6 发出请求。
+ * 在后台指定一台服务器作为"代发服务器"后，由该服务器上的 ns-relay.sh 按时向面板领取任务、
+ * 用 IPv4 发起签到并回传原始响应；结果判定、记录和通知仍在面板完成。
+ *
  * 其他环境变量：
  *   NS_SIGNIN_TIME    每日签到时间（北京时间 HH:MM），默认 08:37
  *   NS_SIGNIN_RANDOM  是否使用"试试手气"，默认 true；false 时为固定奖励
@@ -17,6 +21,8 @@ import { sendNotification } from './notification.js';
 const NS_ORIGIN = 'https://www.nodeseek.com';
 const STATE_KEY = 'nodeseek_signin_state';
 const COOKIE_KEY = 'nodeseek_signin_cookie';
+const OPTIONS_KEY = 'nodeseek_signin_options';
+const MAX_RELAY_BODY = 64 * 1024;
 const MAX_HISTORY = 30;
 const MAX_ATTEMPTS_PER_DAY = 3;
 const MAX_COOKIE_LENGTH = 8192;
@@ -89,9 +95,41 @@ async function loadStoredCookie(db) {
   }
 }
 
+async function loadSigninOptions(db) {
+  try {
+    const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(OPTIONS_KEY).first();
+    const parsed = row?.value ? JSON.parse(row.value) : null;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    console.error('[nodeseek] 读取签到配置失败:', e);
+    return {};
+  }
+}
+
+export function isValidServerId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+// 指定代发服务器；传空值关闭代发模式，恢复由 Worker 直接签到
+export async function setSigninRelay(env, serverId) {
+  const options = await loadSigninOptions(env.DB);
+  if (serverId === null || serverId === undefined || serverId === '') {
+    delete options.relay_server_id;
+  } else {
+    if (!isValidServerId(serverId)) throw new Error('invalidServerId');
+    options.relay_server_id = serverId;
+  }
+  await env.DB.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).bind(OPTIONS_KEY, JSON.stringify(options)).run();
+  return loadSigninState(env.DB);
+}
+
 // 合并后台保存的 Cookie；解密失败（例如 API_SECRET 已更换）时回退到环境变量
 export async function resolveSigninConfig(env) {
   const config = getSigninConfig(env);
+  const options = await loadSigninOptions(env.DB);
+  config.relayServerId = isValidServerId(options.relay_server_id) ? options.relay_server_id : '';
   const stored = await loadStoredCookie(env.DB);
   config.cookieUpdatedAt = stored?.updated_at || null;
   config.storedCookieUnreadable = false;
@@ -262,6 +300,21 @@ export function parseAttendance(data) {
   throw new SigninError(`签到失败：${message || '未知错误'}`, 'error');
 }
 
+// 解读签到接口的原始响应（Worker 直连与服务器代发共用）
+export function interpretAttendanceResponse(status, text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    throw classifyHtmlResponse(status, text);
+  }
+  if (status === 401 || status === 403) {
+    const message = data?.message || `HTTP ${status}`;
+    throw new SigninError(`请求被拒绝：${message}`, isAuthMessage(message) || status === 401 ? 'cookie_invalid' : 'blocked');
+  }
+  return parseAttendance(data);
+}
+
 // ---------------- 状态 ----------------
 
 export async function loadSigninState(db) {
@@ -305,8 +358,52 @@ async function notifyFailure(env, message) {
   }
 }
 
+function startAttempt(state, date, now, { countAttempt }) {
+  if (state.attempts?.date !== date) {
+    state.attempts = { date, count: 0 };
+  }
+  if (countAttempt) {
+    state.attempts.count += 1;
+  }
+  state.attempts.last_at = now;
+  state.last_checked_at = now;
+}
+
+function recordSuccess(state, date, result, now, trigger) {
+  state.today = { date, ...result, rank: result.rank ?? null, at: now, trigger };
+  state.login_invalid = false;
+  state.failure_kind = '';
+  state.error = '';
+  if (state.today.status === 'success' || state.today.status === 'already') {
+    upsertHistory(state, { date, status: state.today.status, gain: state.today.gain });
+  }
+}
+
+async function recordFailure(env, state, error, { date, now, trigger, dryRun, relay = false }) {
+  const message = error?.message || String(error);
+  const kind = FAILURE_KINDS.includes(error?.kind) ? error.kind : 'error';
+  console.error('[nodeseek] 签到失败:', kind, message);
+  state.login_invalid = kind === 'cookie_invalid';
+  state.failure_kind = kind;
+  if (!dryRun) {
+    state.today = { date, status: 'failed', gain: null, rank: null, current: null, message, at: now, trigger };
+    upsertHistory(state, { date, status: 'failed', gain: null });
+    // 同一错误只通知一次
+    if (state.error !== message) {
+      const hint = kind === 'cookie_invalid'
+        ? '\n请在后台「自动任务」中粘贴新的 Cookie'
+        : (kind === 'blocked'
+          ? (relay ? '\n代发服务器的 IP 也被风控，Cookie 不一定失效' : '\nWorkers 出口 IP 可能被风控，Cookie 不一定失效')
+          : '');
+      await notifyFailure(env, `${message}${hint}`);
+    }
+  }
+  state.error = message;
+  return kind;
+}
+
 /**
- * 执行一次签到
+ * 由 Worker 直接执行一次签到（未启用代发模式时）
  * @param {boolean} options.dryRun 只查询今日状态，不签到
  */
 export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron', now = Date.now() } = {}) {
@@ -315,14 +412,7 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
 
   const state = await loadSigninState(env.DB);
   const date = beijingDate(now);
-  if (state.attempts?.date !== date) {
-    state.attempts = { date, count: 0 };
-  }
-  if (!dryRun) {
-    state.attempts.count += 1;
-  }
-  state.attempts.last_at = now;
-  state.last_checked_at = now;
+  startAttempt(state, date, now, { countAttempt: !dryRun });
 
   try {
     if (dryRun) {
@@ -330,50 +420,26 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
         headers: nsHeaders(config)
       }));
       const previous = state.today?.date === date ? state.today : null;
-      state.today = board.signed
-        ? {
-          date,
+      if (board.signed) {
+        recordSuccess(state, date, {
           status: previous?.status === 'success' ? 'success' : 'already',
           gain: board.gain ?? previous?.gain ?? null,
           rank: board.rank,
           current: previous?.current ?? null,
-          message: previous?.message || '今日已签到',
-          at: previous?.at || now,
-          trigger: previous?.trigger || trigger
-        }
-        : { date, status: 'pending', gain: null, rank: null, current: null, message: 'Cookie 有效，今日尚未签到', at: now, trigger };
+          message: previous?.message || '今日已签到'
+        }, previous?.at || now, previous?.trigger || trigger);
+      } else {
+        recordSuccess(state, date, { status: 'pending', gain: null, current: null, message: 'Cookie 有效，今日尚未签到' }, now, trigger);
+      }
     } else {
-      const result = parseAttendance(await requestJson(`${NS_ORIGIN}/api/attendance?random=${config.random}`, {
+      const resp = await fetch(`${NS_ORIGIN}/api/attendance?random=${config.random}`, {
         method: 'POST',
         headers: nsHeaders(config)
-      }));
-      state.today = { date, ...result, rank: null, at: now, trigger };
-    }
-
-    state.login_invalid = false;
-    state.failure_kind = '';
-    state.error = '';
-    if (state.today.status === 'success' || state.today.status === 'already') {
-      upsertHistory(state, { date, status: state.today.status, gain: state.today.gain });
+      });
+      recordSuccess(state, date, interpretAttendanceResponse(resp.status, await resp.text()), now, trigger);
     }
   } catch (e) {
-    const message = e?.message || String(e);
-    const kind = FAILURE_KINDS.includes(e?.kind) ? e.kind : 'error';
-    console.error('[nodeseek] 签到失败:', kind, message);
-    state.login_invalid = kind === 'cookie_invalid';
-    state.failure_kind = kind;
-    if (!dryRun) {
-      state.today = { date, status: 'failed', gain: null, rank: null, current: null, message, at: now, trigger };
-      upsertHistory(state, { date, status: 'failed', gain: null });
-      // 同一错误只通知一次
-      if (state.error !== message) {
-        const hint = kind === 'cookie_invalid'
-          ? '\n请在后台「自动任务」中粘贴新的 Cookie'
-          : (kind === 'blocked' ? '\nWorkers 出口 IP 可能被风控，Cookie 不一定失效' : '');
-        await notifyFailure(env, `${message}${hint}`);
-      }
-    }
-    state.error = message;
+    await recordFailure(env, state, e, { date, now, trigger, dryRun });
   }
 
   await saveSigninState(env.DB, state);
@@ -383,7 +449,7 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
 // 由每分钟的 Cron 调用：到点后签到，失败每 30 分钟重试，每天最多 3 次
 export async function runNodeseekSigninIfDue(env, now = Date.now()) {
   const config = await resolveSigninConfig(env);
-  if (!config.enabled) return null;
+  if (!config.enabled || config.relayServerId) return null;
   if (beijingMinutesOfDay(now) < config.hour * 60 + config.minute) return null;
 
   const state = await loadSigninState(env.DB);
@@ -395,6 +461,73 @@ export async function runNodeseekSigninIfDue(env, now = Date.now()) {
   if (attempts.last_at && now - attempts.last_at < RETRY_INTERVAL_MS && attempts.count > 0) return null;
 
   return runNodeseekSignin(env, { trigger: 'cron', now });
+}
+
+// ---------------- 代发服务器接口 ----------------
+
+/**
+ * 代发服务器领取任务；调用方需先校验该服务器的上报密钥
+ * @param {boolean} options.force 手动执行时忽略签到时间（仍不会重复签到）
+ */
+export async function getRelayTask(env, serverId, { force = false, now = Date.now() } = {}) {
+  const config = await resolveSigninConfig(env);
+  if (!config.relayServerId || config.relayServerId !== serverId) return { due: false, reason: 'not_relay' };
+  if (!config.enabled) return { due: false, reason: 'no_cookie' };
+
+  const state = await loadSigninState(env.DB);
+  const date = beijingDate(now);
+  state.relay_seen_at = now;
+  await saveSigninState(env.DB, state);
+
+  if (state.today?.date === date && ['success', 'already'].includes(state.today.status)) {
+    return { due: false, reason: 'done' };
+  }
+  const attempts = state.attempts?.date === date ? state.attempts.count : 0;
+  if (attempts >= MAX_ATTEMPTS_PER_DAY) return { due: false, reason: 'max_attempts' };
+  if (!force && beijingMinutesOfDay(now) < config.hour * 60 + config.minute) return { due: false, reason: 'too_early' };
+
+  return { due: true, cookie: sanitizeCookie(config.cookie), random: config.random, attempt: attempts + 1 };
+}
+
+// 代发服务器回传 NodeSeek 的原始响应，由面板判定结果
+export async function reportRelayResult(env, serverId, httpStatus, body, now = Date.now()) {
+  const config = await resolveSigninConfig(env);
+  if (!config.relayServerId || config.relayServerId !== serverId) {
+    return { done: false, retry: false, kind: 'error', message: '该服务器不是签到代发服务器' };
+  }
+
+  const state = await loadSigninState(env.DB);
+  const date = beijingDate(now);
+  startAttempt(state, date, now, { countAttempt: true });
+  state.relay_reported_at = now;
+
+  let kind = '';
+  try {
+    const status = Number(httpStatus);
+    if (!Number.isInteger(status) || status <= 0) {
+      throw new SigninError(`代发服务器请求 NodeSeek 失败：${String(body || '').slice(0, 200) || '无响应'}`, 'error');
+    }
+    recordSuccess(state, date, interpretAttendanceResponse(status, String(body || '').slice(0, MAX_RELAY_BODY)), now, 'relay');
+  } catch (e) {
+    kind = await recordFailure(env, state, e, { date, now, trigger: 'relay', dryRun: false, relay: true });
+  }
+  await saveSigninState(env.DB, state);
+
+  const done = ['success', 'already'].includes(state.today?.status);
+  return {
+    done,
+    retry: !done && kind !== 'cookie_invalid' && state.attempts.count < MAX_ATTEMPTS_PER_DAY,
+    kind: done ? state.today.status : kind,
+    message: state.today?.message || ''
+  };
+}
+
+// 代发脚本使用的纯文本格式：每行 key=value，值中不含换行
+export function formatRelayText(fields) {
+  return Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${String(value).replace(/[\r\n]+/g, ' ')}`)
+    .join('\n') + '\n';
 }
 
 // ---------------- 视图 ----------------
@@ -462,8 +595,11 @@ export function buildSigninAdminView(config, state, now = Date.now()) {
       has_cookie: Boolean(config.cookie),
       cookie_source: config.cookieSource || '',
       cookie_updated_at: config.cookieUpdatedAt || null,
-      stored_cookie_unreadable: Boolean(config.storedCookieUnreadable)
+      stored_cookie_unreadable: Boolean(config.storedCookieUnreadable),
+      relay_server_id: config.relayServerId || ''
     },
+    relay_seen_at: state?.relay_seen_at || null,
+    relay_reported_at: state?.relay_reported_at || null,
     detail: state?.today || null,
     attempts: state?.attempts || null,
     error: state?.error || '',

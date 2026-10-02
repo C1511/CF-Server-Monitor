@@ -21,10 +21,16 @@ import {
   buildSigninPublicView,
   resolveSigninConfig,
   runNodeseekSignin,
+  formatRelayText,
+  getRelayTask,
+  loadSigninState,
+  reportRelayResult,
   runNodeseekSigninIfDue,
   sanitizeCookie,
-  setSigninCookie
+  setSigninCookie,
+  setSigninRelay
 } from '../src/services/nodeseekSignin.js';
+import { deriveAgentSecret } from '../src/utils/agentSecret.js';
 
 const GB = 1024 ** 3;
 
@@ -601,4 +607,107 @@ test('billing sends the RegionId matching each site and reports every site tried
   } finally {
     f.restore();
   }
+});
+
+test('billing also treats NotApplicable site mismatch as a reason to try the other site', async () => {
+  const handler = aliyunHandler({ trafficGB: 10, status: 'Running' });
+  const f = mockFetch((u, init) => {
+    if (u.hostname === 'business.aliyuncs.com' && u.searchParams.get('Action') === 'QueryBillOverview') {
+      return Response.json({ Code: 'NotApplicable', Message: 'You are not authorized to call the API operation. Please check whether the caller site matches the API domain regionId.' }, { status: 400 });
+    }
+    return handler(u, init);
+  });
+  try {
+    const state = await runAliyunKeepalive(aliyunEnv(), { now: 1000, forceBilling: true });
+    assert.equal(state.billing_error, '');
+    assert.equal(state.billing.endpoint, 'business.ap-southeast-1.aliyuncs.com');
+  } finally {
+    f.restore();
+  }
+});
+
+// ---------------- 签到代发 ----------------
+
+const IPV6_PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>提醒，ipv6已关闭 | NodeSeek</title></head><body></body></html>';
+
+async function relayEnv() {
+  const env = { DB: createD1(), NS_COOKIE: 'session=s1; cf_clearance=zzz', API_SECRET: 'relay-test-secret' };
+  await setSigninRelay(env, 'srv-hk');
+  return env;
+}
+
+test('relay task: only the designated server gets work, respects schedule unless forced', async () => {
+  const env = await relayEnv();
+  assert.equal((await getRelayTask(env, 'other', { now: AFTER_SCHEDULE })).reason, 'not_relay');
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: BEFORE_SCHEDULE })).reason, 'too_early');
+
+  const forced = await getRelayTask(env, 'srv-hk', { now: BEFORE_SCHEDULE, force: true });
+  assert.equal(forced.due, true);
+  assert.equal(forced.cookie, 'session=s1', 'Cloudflare cookies stripped');
+  assert.equal(forced.attempt, 1);
+
+  await setSigninRelay(env, null);
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE })).reason, 'not_relay', 'disabled');
+});
+
+test('relay mode stops the Worker from signing in by itself', async () => {
+  const env = await relayEnv();
+  const f = mockFetch(nsHandler());
+  try {
+    assert.equal(await runNodeseekSigninIfDue(env, AFTER_SCHEDULE), null);
+    assert.equal(f.calls.length, 0);
+  } finally {
+    f.restore();
+  }
+});
+
+test('relay report: success finishes the day; IPv6 page / risk retries; expired cookie does not retry', async () => {
+  let env = await relayEnv();
+  let r = await reportRelayResult(env, 'srv-hk', '200', JSON.stringify({ success: true, message: '获得鸡腿 6 个', gain: 6, current: 99 }), AFTER_SCHEDULE);
+  assert.deepEqual([r.done, r.retry, r.kind], [true, false, 'success']);
+  let state = await loadSigninState(env.DB);
+  assert.deepEqual([state.today.status, state.today.gain, state.today.trigger], ['success', 6, 'relay']);
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 60000 })).reason, 'done');
+
+  env = await relayEnv();
+  r = await reportRelayResult(env, 'srv-hk', '200', IPV6_PAGE, AFTER_SCHEDULE);
+  assert.deepEqual([r.done, r.retry, r.kind], [false, true, 'blocked']);
+  assert.match(r.message, /ipv6已关闭/);
+  r = await reportRelayResult(env, 'srv-hk', '200', JSON.stringify({ success: false, message: 'high risk action' }), AFTER_SCHEDULE + 600000);
+  assert.deepEqual([r.retry, r.kind], [true, 'blocked']);
+  r = await reportRelayResult(env, 'srv-hk', '0', 'curl: (28) timed out', AFTER_SCHEDULE + 1200000);
+  assert.deepEqual([r.retry, r.kind], [false, 'error'], 'third attempt: no more retries');
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 1300000, force: true })).reason, 'max_attempts');
+
+  env = await relayEnv();
+  r = await reportRelayResult(env, 'srv-hk', '500', JSON.stringify({ success: false, status: 404, message: 'USER NOT FOUND' }), AFTER_SCHEDULE);
+  assert.deepEqual([r.done, r.retry, r.kind], [false, false, 'cookie_invalid']);
+  assert.equal((await loadSigninState(env.DB)).login_invalid, true);
+
+  assert.equal((await reportRelayResult(env, 'intruder', '200', '{}', AFTER_SCHEDULE)).done, false);
+});
+
+test('relay text format is one key=value per line without injected newlines', () => {
+  assert.equal(formatRelayText({ due: true, reason: undefined, message: 'a\nb\r\nc' }), 'due=true\nmessage=a b c\n');
+});
+
+test('relay HTTP routes authenticate with the relay server\'s own secret', async () => {
+  const { default: worker } = await import('../src/index.js');
+  const env = await relayEnv();
+  const good = await deriveAgentSecret(env.API_SECRET, 'srv-hk');
+  const call = (path, headers, body = '') => worker.fetch(new Request(`https://board.example${path}`, { method: 'POST', headers, body }), env, { waitUntil() {} });
+
+  let res = await call('/relay/nodeseek/task?force=1', { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': 'wrong' });
+  assert.equal(res.status, 401);
+  res = await call('/relay/nodeseek/task?force=1', { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': env.API_SECRET });
+  assert.equal(res.status, 401, 'master secret is not accepted');
+
+  res = await call('/relay/nodeseek/task?force=1', { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': good });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /^due=true$/m);
+  assert.match(text, /^cookie=session=s1$/m);
+
+  res = await call('/relay/nodeseek/report', { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': good, 'X-Relay-Status': '200' }, JSON.stringify({ success: true, message: 'ok', gain: 3 }));
+  assert.match(await res.text(), /^done=1$/m);
 });

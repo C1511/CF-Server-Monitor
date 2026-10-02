@@ -248,8 +248,9 @@ async function callBss(config, action, params = {}, endpoint = config.bssEndpoin
   return data;
 }
 
+// 站点不匹配的两种报错：AuthSiteFail（账号与站点不符）、NotApplicable（调用方站点与接口域名 regionId 不符）
 function isAuthSiteError(e) {
-  return /AuthSiteFail|auth site/i.test(String(e?.message || e));
+  return /AuthSiteFail|auth site|NotApplicable|caller site/i.test(String(e?.message || e));
 }
 
 // 账号属于中国站还是国际站无法预先得知：未显式配置时依次尝试，AuthSiteFail 表示站点不匹配
