@@ -870,3 +870,26 @@ test('visitor mode is removed: data endpoints require login even if is_public wa
   assert.equal(config.is_public, false);
   clearSiteSettingsCache();
 });
+
+test('initDatabase trusts the edge-cache marker but clearHistory forces a rebuild', async () => {
+  const schema = await import('../src/database/schema.js');
+  const store = new Map();
+  const original = globalThis.caches;
+  globalThis.caches = { default: {
+    match: async key => store.get(String(key)) || undefined,
+    put: async (key, res) => { store.set(String(key), res); }
+  } };
+  try {
+    const db = createD1();
+    await schema.clearHistory(db); // force: creates tables and sets the marker
+    assert.equal(store.size, 1, 'marker stored');
+    const tables = async () => (await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_history'").all()).results.length;
+    assert.equal(await tables(), 1);
+
+    await db.prepare('DROP TABLE metrics_history').run();
+    await schema.clearHistory(db);
+    assert.equal(await tables(), 1, 'rebuilt despite cached marker');
+  } finally {
+    globalThis.caches = original;
+  }
+});

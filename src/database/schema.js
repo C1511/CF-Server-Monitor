@@ -46,8 +46,27 @@ export function clearDashboardLatencyHistoryCache() {
   dashboardLatencyHistoryCache.clear();
 }
 
-export async function initDatabase(db) {
-  if (dbInitialized) return;
+// 机房本地缓存中的"已初始化"标记：同一机房新启动的实例无需再跨洲查询表结构
+const DB_INIT_CACHE_KEY = 'https://cfsm.internal/db-initialized/v1';
+
+function getEdgeCache() {
+  return typeof caches !== 'undefined' && caches.default ? caches.default : null;
+}
+
+export async function initDatabase(db, { force = false } = {}) {
+  if (dbInitialized && !force) return;
+
+  const edgeCache = getEdgeCache();
+  if (!force && edgeCache) {
+    try {
+      if (await edgeCache.match(DB_INIT_CACHE_KEY)) {
+        dbInitialized = true;
+        return;
+      }
+    } catch (_) {
+      // 缓存不可用时按原流程检查
+    }
+  }
 
   debug('初始化数据库');
   
@@ -125,6 +144,11 @@ export async function initDatabase(db) {
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;
+    if (edgeCache) {
+      await edgeCache.put(DB_INIT_CACHE_KEY, new Response('1', {
+        headers: { 'Cache-Control': 'max-age=86400' }
+      })).catch(() => {});
+    }
   } catch (e) {
     console.error('❌ 数据库初始化失败:', e);
   }
@@ -142,7 +166,8 @@ export async function clearHistory(db) {
     
     dbInitialized = false;
     
-    await initDatabase(db);
+    // 表刚被删除，必须跳过"已初始化"缓存标记重新建表
+    await initDatabase(db, { force: true });
 
     await clearAllCaches(db);
     clearDashboardLatencyHistoryCache();
