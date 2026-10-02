@@ -152,9 +152,21 @@ function formatTime(hour, minute) {
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
 
+// cf_clearance 等 Cloudflare 验证 Cookie 绑定浏览器的 IP 与 User-Agent，从 Workers 发出时不匹配，
+// 带上反而容易触发人机验证，因此发送前剔除，只保留站点自身的登录 Cookie
+const CLOUDFLARE_COOKIE_RE = /^(cf_clearance|__cf_bm|__cflb|_cfuvid|cf_chl_\w*)$/i;
+
+export function sanitizeCookie(cookie) {
+  return String(cookie || '')
+    .split(';')
+    .map(part => part.trim())
+    .filter(part => part && !CLOUDFLARE_COOKIE_RE.test(part.split('=')[0].trim()))
+    .join('; ');
+}
+
 function nsHeaders(config) {
   return {
-    Cookie: config.cookie,
+    Cookie: sanitizeCookie(config.cookie),
     'User-Agent': USER_AGENT,
     Accept: 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9',

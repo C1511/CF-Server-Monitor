@@ -22,6 +22,7 @@ import {
   resolveSigninConfig,
   runNodeseekSignin,
   runNodeseekSigninIfDue,
+  sanitizeCookie,
   setSigninCookie
 } from '../src/services/nodeseekSignin.js';
 
@@ -550,6 +551,21 @@ test('an explicitly configured billing endpoint is not second-guessed', async ()
     const state = await runAliyunKeepalive(env, { now: 1000, forceBilling: true });
     assert.match(state.billing_error, /AuthSiteFail/);
     assert.equal(f.calls.some(c => c.url.hostname === 'business.ap-southeast-1.aliyuncs.com'), false);
+  } finally {
+    f.restore();
+  }
+});
+
+test('Cloudflare clearance cookies are stripped before calling NodeSeek', async () => {
+  assert.equal(
+    sanitizeCookie('colorscheme=light; session=s1; pjwt=p1; cf_clearance=abc.def-1.2; __cf_bm=x; _cfuvid=y; fog=z'),
+    'colorscheme=light; session=s1; pjwt=p1; fog=z'
+  );
+  const env = { DB: createD1(), NS_COOKIE: 'session=s1; cf_clearance=abc', API_SECRET: 's' };
+  const f = mockFetch(nsHandler());
+  try {
+    await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
+    assert.equal(f.calls.at(-1).init.headers.Cookie, 'session=s1');
   } finally {
     f.restore();
   }
