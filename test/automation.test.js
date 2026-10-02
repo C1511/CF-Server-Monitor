@@ -734,3 +734,20 @@ test('forced relay runs ignore the daily attempt cap', async () => {
   assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 10 })).reason, 'max_attempts');
   assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 10, force: true })).due, true);
 });
+
+test('refreshed cookie from the relay is stored only when the check-in succeeds', async () => {
+  let env = await relayEnv();
+  await reportRelayResult(env, 'srv-hk', '200', '{"success":false,"message":"x"}', AFTER_SCHEDULE, { refreshedCookie: 'session=s1; pjwt=new' });
+  assert.equal((await resolveSigninConfig(env)).cookieSource, 'env', 'failure: not stored');
+
+  await reportRelayResult(env, 'srv-hk', '200', '{"success":true,"message":"ok","gain":2}', AFTER_SCHEDULE + 1, { refreshedCookie: 'session=s1; pjwt=new' });
+  const config = await resolveSigninConfig(env);
+  assert.deepEqual([config.cookieSource, config.cookie], ['admin', 'session=s1; pjwt=new']);
+  const raw = (await env.DB.prepare("SELECT value FROM settings WHERE key = 'nodeseek_signin_cookie'").first()).value;
+  assert.equal(raw.includes('pjwt=new'), false, 'encrypted at rest');
+  assert.ok((await loadSigninState(env.DB)).cookie_refreshed_at);
+
+  env = await relayEnv();
+  await reportRelayResult(env, 'srv-hk', '200', '{"success":true,"message":"ok"}', AFTER_SCHEDULE, { refreshedCookie: 'bad\r\ncookie' });
+  assert.equal((await resolveSigninConfig(env)).cookieSource, 'env', 'invalid cookie ignored');
+});

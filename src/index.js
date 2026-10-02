@@ -308,7 +308,8 @@ export default {
         if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
         const body = await request.text();
         const result = await reportRelayResult(env, serverId, request.headers.get('X-Relay-Status'), body, Date.now(), {
-          location: request.headers.get('X-Relay-Location') || ''
+          location: request.headers.get('X-Relay-Location') || '',
+          refreshedCookie: request.headers.get('X-Relay-Cookie') || ''
         });
         return relayTextResponse({ done: result.done ? 1 : 0, retry: result.retry ? 1 : 0, kind: result.kind, message: result.message });
       }},

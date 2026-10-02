@@ -81,6 +81,10 @@ panel_request() {
         if [ -n "${RELAY_LOCATION:-}" ]; then
             printf 'header = "X-Relay-Location: %s"\n' "$RELAY_LOCATION"
         fi
+        # 签到过程中 NodeSeek 刷新了凭证：把合并后的 Cookie 交回面板加密保存
+        if [ -n "${RELAY_COOKIE:-}" ]; then
+            printf 'header = "X-Relay-Cookie: %s"\n' "$(curl_quote "$RELAY_COOKIE")"
+        fi
         printf 'header = "Content-Type: text/plain; charset=utf-8"\n'
         if [ -z "$body_file" ]; then
             printf 'data = ""\n'
@@ -99,7 +103,7 @@ fetch_task() {
     RELAY_STATUS="" panel_request "/relay/nodeseek/task$force_query"
 }
 
-do_signin() {
+signin_request() {
     cookie="$1"
     random="$2"
     body_file="$3"
@@ -111,8 +115,52 @@ do_signin() {
         printf 'header = "Accept-Language: zh-CN,zh;q=0.9"\n'
         printf 'header = "Origin: %s"\n' "$NS_ORIGIN"
         printf 'header = "Referer: %s/board"\n' "$NS_ORIGIN"
+        # 与浏览器 fetch 一致：空请求体，不带表单 Content-Type
+        printf 'header = "Content-Type:"\n'
         printf 'data = ""\n'
     } | curl -4 -sS -m 30 --connect-timeout 10 -D "$body_file.hdr" -o "$body_file" -w '%{http_code}' -K - 2>"$body_file.err"
+}
+
+# 响应头中的 Set-Cookie，输出 name=value（每行一个，跳过空值）
+set_cookie_pairs() {
+    sed -n 's/^[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]:[[:space:]]*//p' "$1" 2>/dev/null \
+        | tr -d '\r' | cut -d';' -f1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '^[^=]+=.+' || true
+}
+
+# 用新 Cookie 覆盖同名旧值：merge_cookies "a=1; b=2" "b=3\nc=4" -> "a=1; b=3; c=4"
+merge_cookies() {
+    printf '%s\n' "$2" | awk -v old="$1" '
+        BEGIN { n = split(old, parts, /;[[:space:]]*/); for (i = 1; i <= n; i++) { if (parts[i] == "") continue; k = parts[i]; sub(/=.*/, "", k); if (!(k in val)) order[++cnt] = k; val[k] = parts[i] } }
+        NF { k = $0; sub(/=.*/, "", k); if (!(k in val)) order[++cnt] = k; val[k] = $0 }
+        END { out = ""; for (i = 1; i <= cnt; i++) out = out (out == "" ? "" : "; ") val[order[i]]; print out }'
+}
+
+# 发起签到；NodeSeek 刷新登录凭证时会返回 303 + Set-Cookie 并跳回签到地址，
+# 浏览器会带上新 Cookie 重新提交，这里同样处理（最多 2 次）。
+# 结果写入 SIGNIN_CODE；凭证有更新时 SIGNIN_COOKIE 为合并后的 Cookie，否则为空
+do_signin() {
+    SIGNIN_COOKIE=""
+    current="$1"
+    hops=0
+    while :; do
+        SIGNIN_CODE="$(signin_request "$current" "$2" "$3")" || SIGNIN_CODE="000"
+        case "$SIGNIN_CODE" in
+            301|302|303|307|308) ;;
+            *) break ;;
+        esac
+        case "$(redirect_location "$3.hdr")" in
+            */api/attendance*|/api/attendance*) ;;
+            *) break ;;
+        esac
+        fresh="$(set_cookie_pairs "$3.hdr")"
+        [ -n "$fresh" ] || break
+        hops=$((hops + 1))
+        [ "$hops" -le 2 ] || break
+        log "NodeSeek 刷新了登录凭证（$(printf '%s\n' "$fresh" | cut -d= -f1 | tr '\n' ' ')），带新 Cookie 重新提交"
+        current="$(merge_cookies "$current" "$fresh")"
+        SIGNIN_COOKIE="$current"
+    done
+    current=""
 }
 
 # 从响应头中取出跳转地址（去掉回车、引号，最长 300 字符）
@@ -143,8 +191,11 @@ cmd_run() {
         random="$(field random "$task")"
         [ "$random" = "false" ] || random="true"
         log "第 ${attempt} 次签到（IPv4）..."
-        code="$(do_signin "$cookie" "$random" "$tmp_body")" || code="000"
+        do_signin "$cookie" "$random" "$tmp_body"
+        code="$SIGNIN_CODE"
         cookie=""
+        RELAY_COOKIE="$SIGNIN_COOKIE"
+        SIGNIN_COOKIE=""
 
         if [ "$code" = "000" ]; then
             head -c 300 "$tmp_body.err" > "$tmp_body.report" 2>/dev/null
@@ -157,6 +208,7 @@ cmd_run() {
         result="$(panel_request "/relay/nodeseek/report" "$tmp_body.report")" || die "签到已发出，但回传结果到面板失败"
         RELAY_STATUS=""
         RELAY_LOCATION=""
+        RELAY_COOKIE=""
         log "结果：$(field kind "$result") $(field message "$result")"
 
         if [ "$(field done "$result")" = "1" ]; then

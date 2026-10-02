@@ -148,12 +148,15 @@ export async function resolveSigninConfig(env) {
   return config;
 }
 
-// 后台更新 Cookie；传空值则删除，回退到环境变量
-export async function setSigninCookie(env, cookie, now = Date.now()) {
+function normalizeCookieInput(cookie) {
   const value = String(cookie ?? '').trim().replace(/^cookie:\s*/i, '');
   if (value.length > MAX_COOKIE_LENGTH || /[\r\n]/.test(value)) {
     throw new Error('invalidCookie');
   }
+  return value;
+}
+
+async function storeCookie(env, value, now) {
   if (value) {
     const encrypted = await encryptCookie(env.API_SECRET, value);
     await env.DB.prepare(
@@ -162,6 +165,12 @@ export async function setSigninCookie(env, cookie, now = Date.now()) {
   } else {
     await env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(COOKIE_KEY).run();
   }
+}
+
+// 后台更新 Cookie；传空值则删除，回退到环境变量
+export async function setSigninCookie(env, cookie, now = Date.now()) {
+  const value = normalizeCookieInput(cookie);
+  await storeCookie(env, value, now);
 
   // 换了 Cookie 后清除失效标记，并重置今日尝试次数，让定时任务重新尝试
   const state = await loadSigninState(env.DB);
@@ -507,7 +516,7 @@ export async function getRelayTask(env, serverId, { force = false, now = Date.no
 }
 
 // 代发服务器回传 NodeSeek 的原始响应，由面板判定结果
-export async function reportRelayResult(env, serverId, httpStatus, body, now = Date.now(), { location = '' } = {}) {
+export async function reportRelayResult(env, serverId, httpStatus, body, now = Date.now(), { location = '', refreshedCookie = '' } = {}) {
   const config = await resolveSigninConfig(env);
   if (!config.relayServerId || config.relayServerId !== serverId) {
     return { done: false, retry: false, kind: 'error', message: '该服务器不是签到代发服务器' };
@@ -528,9 +537,21 @@ export async function reportRelayResult(env, serverId, httpStatus, body, now = D
   } catch (e) {
     kind = await recordFailure(env, state, e, { date, now, trigger: 'relay', dryRun: false, relay: true });
   }
+  const done = ['success', 'already'].includes(state.today?.status);
+  // 只在签到成功时采用刷新后的 Cookie，避免用异常响应里的 Cookie 覆盖可用的旧值
+  if (done && refreshedCookie) {
+    try {
+      const value = normalizeCookieInput(refreshedCookie);
+      if (value && value !== config.cookie) {
+        await storeCookie(env, value, now);
+        state.cookie_refreshed_at = now;
+      }
+    } catch (e) {
+      console.warn('[nodeseek] 忽略无效的刷新 Cookie:', e?.message || e);
+    }
+  }
   await saveSigninState(env.DB, state);
 
-  const done = ['success', 'already'].includes(state.today?.status);
   return {
     done,
     retry: !done && kind !== 'cookie_invalid' && state.attempts.count < MAX_ATTEMPTS_PER_DAY,
