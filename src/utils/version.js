@@ -9,6 +9,11 @@ let cachedRemoteVersionAt = 0;
 let cachedRemoteVersionFailureAt = 0;
 let remoteVersionPromise = null;
 
+// 立即返回已缓存的版本信息（可能为 null），不发起网络请求
+export function peekRemoteVersion() {
+  return cachedRemoteVersion;
+}
+
 export async function getRemoteVersion() {
   const now = Date.now();
   if (cachedRemoteVersion && now - cachedRemoteVersionAt < REMOTE_VERSION_TTL) {

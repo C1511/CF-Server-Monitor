@@ -52,9 +52,12 @@ export async function initDatabase(db) {
   debug('初始化数据库');
   
   try {
-    const SettingTableExists = await db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' AND name='settings'
-    `).first();
+    // 一次查询确认三张核心表是否存在，减少冷启动时的数据库往返
+    const { results: tables = [] } = await db.prepare(`
+      SELECT name FROM sqlite_master WHERE type='table' AND name IN ('settings', 'servers', 'metrics_history')
+    `).all();
+    const existingTables = new Set(tables.map(table => table.name));
+    const SettingTableExists = existingTables.has('settings');
     if (!SettingTableExists) {
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS settings (
@@ -66,9 +69,7 @@ export async function initDatabase(db) {
     }
 
     // 判断servers表是否存在
-    const ServerTableExists = await db.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' AND name='servers'
-    `).first();
+    const ServerTableExists = existingTables.has('servers');
     if (!ServerTableExists) {
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS servers (
@@ -118,7 +119,9 @@ export async function initDatabase(db) {
     }
 
     // 确保 metrics_history 表存在（主键 id 已编码分区与时间，无需二级索引）
-    await db.prepare(createHistoryTableSql('metrics_history')).run();
+    if (!existingTables.has('metrics_history')) {
+      await db.prepare(createHistoryTableSql('metrics_history')).run();
+    }
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;

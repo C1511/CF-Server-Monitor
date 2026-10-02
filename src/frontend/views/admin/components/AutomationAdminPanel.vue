@@ -178,7 +178,9 @@
           <div><span>{{ trans.lastCheck }}</span><b>{{ formatDateTime(signin.last_checked_at) }}</b></div>
         </div>
 
-        <table v-if="signin.history_30?.length" class="automation-table">
+        <details v-if="signin.history_30?.length" class="history-details">
+          <summary>{{ trans.signinHistoryRecords }}（{{ signin.history_30.length }}）</summary>
+        <table class="automation-table">
           <tbody>
             <tr v-for="h in signin.history_30" :key="h.date">
               <td class="nowrap">{{ h.date }}</td>
@@ -187,6 +189,7 @@
             </tr>
           </tbody>
         </table>
+        </details>
       </template>
 
       <template v-if="signinLoaded && signin?.config">
@@ -591,6 +594,16 @@ watch(() => props.activeTab, (tab) => {
 .automation-table .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+.history-details {
+  margin-top: 10px;
+}
+
+.history-details summary {
+  cursor: pointer;
+  color: var(--accent-cyan);
+  user-select: none;
 }
 
 .nowrap { white-space: nowrap; }

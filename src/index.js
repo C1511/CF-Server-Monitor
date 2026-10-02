@@ -17,7 +17,7 @@ import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCac
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
 import { verifyTurnstileToken } from './utils/common.js';
 import { getCorsAllowedOrigins, createOptionsResponse, applyCors } from './utils/cors.js';
-import { getRemoteVersion } from './utils/version.js';
+import { getRemoteVersion, peekRemoteVersion } from './utils/version.js';
 import {
   HISTORY_ALL_QUERY_COLUMNS
 } from './utils/historyFields.js';
@@ -244,8 +244,12 @@ export default {
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
+    // 各阶段耗时，通过 Server-Timing 响应头输出（仅数字，便于排查加载慢）
+    const serverTiming = [];
     if (path === '/api/config' || path === '/api/theme_options' || path === '/clearHistory') {
+      const initStart = Date.now();
       await initDatabase(env.DB);
+      serverTiming.push(`init;dur=${Date.now() - initStart}`);
     }
 
     // /api/config 在不带 X-Turnstile-Token 且不带 X-Turnstile-Verified 时仍然 bypass（用于初始化判断是否需要验证），
@@ -346,8 +350,12 @@ export default {
         }
       }},
       { method: 'GET', path: '/api/config', handler: async () => {
-        await ensureSiteSettings();
-        const appearanceOptions = await loadAppearanceOptions(env.DB);
+        const settingsStart = Date.now();
+        const [, appearanceOptions] = await Promise.all([
+          ensureSiteSettings(),
+          loadAppearanceOptions(env.DB)
+        ]);
+        serverTiming.push(`settings;dur=${Date.now() - settingsStart}`);
         const turnstileEnabled = sys.turnstile_enabled === 'true';
         const turnstileLoginEnabled = sys.turnstile_login_enabled === 'true';
         let verified = false;
@@ -364,7 +372,11 @@ export default {
         }
 
         const isLoggedIn = await checkAuth(request, env, sys);
-        const remoteVersion = isLoggedIn ? await getRemoteVersion() : null;
+        // 版本检查要访问 GitHub（最多 2 秒），不再阻塞首屏：先用缓存，后台刷新
+        const remoteVersion = isLoggedIn ? peekRemoteVersion() : null;
+        if (isLoggedIn) {
+          ctx.waitUntil(getRemoteVersion().catch(() => null));
+        }
 
         return createSuccessResponse({
           version: CURRENT_VERSION,
@@ -399,7 +411,7 @@ export default {
             points: DASHBOARD_LATENCY_WINDOW_POINTS,
             hours: DASHBOARD_LATENCY_WINDOW_HOURS
           }
-        });
+        }, { 'Server-Timing': serverTiming.join(', ') });
       }},
       { method: 'POST', path: '/auth/github', handler: async () => {
         await ensureSiteSettings();
