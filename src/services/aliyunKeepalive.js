@@ -228,12 +228,17 @@ function callEcs(config, action, params) {
   });
 }
 
+// 国际站账单接口位于新加坡，其余（中国站）使用杭州
+function bssRegionFor(endpoint) {
+  return endpoint === BSS_ENDPOINT_INTL ? 'ap-southeast-1' : 'cn-hangzhou';
+}
+
 async function callBss(config, action, params = {}, endpoint = config.bssEndpoint) {
   const data = await callApi({
     endpoint,
     version: BSS_VERSION,
     action,
-    params,
+    params: { RegionId: bssRegionFor(endpoint), ...params },
     ...credentials(config)
   });
   // 账单接口出错时也可能返回 HTTP 200
@@ -255,8 +260,9 @@ function bssEndpointCandidates(config, preferred) {
 
 async function fetchBilling(config, now, preferredEndpoint) {
   const billingCycle = beijingMonth(now);
+  const candidates = bssEndpointCandidates(config, preferredEndpoint);
   let lastError = null;
-  for (const endpoint of bssEndpointCandidates(config, preferredEndpoint)) {
+  for (const endpoint of candidates) {
     try {
       const [balance, overview] = await Promise.all([
         callBss(config, 'QueryAccountBalance', {}, endpoint),
@@ -274,7 +280,7 @@ async function fetchBilling(config, now, preferredEndpoint) {
       if (!isAuthSiteError(e)) throw e;
     }
   }
-  throw lastError;
+  throw new Error(`${lastError?.message || lastError}（已尝试：${candidates.join('、')}）`);
 }
 
 async function fetchCdtTraffic(config) {

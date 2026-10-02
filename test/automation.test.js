@@ -570,3 +570,35 @@ test('Cloudflare clearance cookies are stripped before calling NodeSeek', async 
     f.restore();
   }
 });
+
+test('billing sends the RegionId matching each site and reports every site tried', async () => {
+  const env = aliyunEnv();
+  const handler = aliyunHandler({ trafficGB: 10, status: 'Running' });
+  let f = mockFetch((u, init) => {
+    if (u.hostname === 'business.aliyuncs.com') {
+      return Response.json({ Code: 'AuthSiteFail', Message: 'auth site failed.' }, { status: 400 });
+    }
+    return handler(u, init);
+  });
+  try {
+    await runAliyunKeepalive(env, { now: 1000, forceBilling: true });
+    const region = host => f.calls.find(c => c.url.hostname === host && c.url.searchParams.get('Action') === 'QueryAccountBalance').url.searchParams.get('RegionId');
+    assert.equal(region('business.aliyuncs.com'), 'cn-hangzhou');
+    assert.equal(region('business.ap-southeast-1.aliyuncs.com'), 'ap-southeast-1');
+  } finally {
+    f.restore();
+  }
+
+  f = mockFetch((u, init) => {
+    if (u.hostname.startsWith('business.')) {
+      return Response.json({ Code: 'AuthSiteFail', Message: 'auth site failed.' }, { status: 400 });
+    }
+    return handler(u, init);
+  });
+  try {
+    const state = await runAliyunKeepalive(aliyunEnv(), { now: 1000, forceBilling: true });
+    assert.match(state.billing_error, /已尝试：business\.aliyuncs\.com、business\.ap-southeast-1\.aliyuncs\.com/);
+  } finally {
+    f.restore();
+  }
+});
