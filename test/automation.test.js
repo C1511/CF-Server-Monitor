@@ -677,7 +677,7 @@ test('relay report: success finishes the day; IPv6 page / risk retries; expired 
   assert.deepEqual([r.retry, r.kind], [true, 'blocked']);
   r = await reportRelayResult(env, 'srv-hk', '0', 'curl: (28) timed out', AFTER_SCHEDULE + 1200000);
   assert.deepEqual([r.retry, r.kind], [false, 'error'], 'third attempt: no more retries');
-  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 1300000, force: true })).reason, 'max_attempts');
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 1300000 })).reason, 'max_attempts');
 
   env = await relayEnv();
   r = await reportRelayResult(env, 'srv-hk', '500', JSON.stringify({ success: false, status: 404, message: 'USER NOT FOUND' }), AFTER_SCHEDULE);
@@ -710,4 +710,27 @@ test('relay HTTP routes authenticate with the relay server\'s own secret', async
 
   res = await call('/relay/nodeseek/report', { 'X-Relay-Id': 'srv-hk', 'X-Relay-Secret': good, 'X-Relay-Status': '200' }, JSON.stringify({ success: true, message: 'ok', gain: 3 }));
   assert.match(await res.text(), /^done=1$/m);
+});
+
+test('3xx responses are classified by redirect target, not by the generic page title', async () => {
+  const page = '<html><head><title>303 See Other</title></head><body><center>303 See Other</center></body></html>';
+  const cases = [
+    ['/signIn.html?redirect=%2Fboard', 'cookie_invalid'],
+    ['https://www.nodeseek.com/cdn-cgi/challenge-platform/h/b', 'blocked'],
+    ['/somewhere-else', 'error'],
+    ['', 'error']
+  ];
+  for (const [location, kind] of cases) {
+    const env = await relayEnv();
+    const r = await reportRelayResult(env, 'srv-hk', '303', page, AFTER_SCHEDULE, { location });
+    assert.equal(r.kind, kind, location);
+    if (location) assert.ok(r.message.includes(location.slice(0, 40)), r.message);
+  }
+});
+
+test('forced relay runs ignore the daily attempt cap', async () => {
+  const env = await relayEnv();
+  for (let i = 0; i < 3; i++) await reportRelayResult(env, 'srv-hk', '200', '{"success":false,"message":"x"}', AFTER_SCHEDULE + i);
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 10 })).reason, 'max_attempts');
+  assert.equal((await getRelayTask(env, 'srv-hk', { now: AFTER_SCHEDULE + 10, force: true })).due, true);
 });

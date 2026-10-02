@@ -300,8 +300,24 @@ export function parseAttendance(data) {
   throw new SigninError(`签到失败：${message || '未知错误'}`, 'error');
 }
 
+// 接口返回 3xx 时按跳转目标判断原因（页面标题只有 "303 See Other"，不足以判断）
+export function classifyRedirect(status, location) {
+  const target = String(location || '').trim().slice(0, 200);
+  const where = target ? `跳转到 ${target}` : '未提供跳转地址';
+  if (/sign_?in|login|登录/i.test(target)) {
+    return new SigninError(`登录已失效：接口返回 HTTP ${status}，${where}`, 'cookie_invalid');
+  }
+  if (/challenge|cdn-cgi|captcha|verify|turnstile|risk|block/i.test(target)) {
+    return new SigninError(`被风控拦截：接口返回 HTTP ${status}，${where}`, 'blocked');
+  }
+  return new SigninError(`接口返回 HTTP ${status} 重定向，${where}`, 'error');
+}
+
 // 解读签到接口的原始响应（Worker 直连与服务器代发共用）
-export function interpretAttendanceResponse(status, text) {
+export function interpretAttendanceResponse(status, text, { location = '' } = {}) {
+  if (status >= 300 && status < 400) {
+    throw classifyRedirect(status, location);
+  }
   let data;
   try {
     data = JSON.parse(text);
@@ -483,14 +499,15 @@ export async function getRelayTask(env, serverId, { force = false, now = Date.no
     return { due: false, reason: 'done' };
   }
   const attempts = state.attempts?.date === date ? state.attempts.count : 0;
-  if (attempts >= MAX_ATTEMPTS_PER_DAY) return { due: false, reason: 'max_attempts' };
+  // 手动 --force 执行用于排查，不受每日次数上限限制
+  if (!force && attempts >= MAX_ATTEMPTS_PER_DAY) return { due: false, reason: 'max_attempts' };
   if (!force && beijingMinutesOfDay(now) < config.hour * 60 + config.minute) return { due: false, reason: 'too_early' };
 
   return { due: true, cookie: sanitizeCookie(config.cookie), random: config.random, attempt: attempts + 1 };
 }
 
 // 代发服务器回传 NodeSeek 的原始响应，由面板判定结果
-export async function reportRelayResult(env, serverId, httpStatus, body, now = Date.now()) {
+export async function reportRelayResult(env, serverId, httpStatus, body, now = Date.now(), { location = '' } = {}) {
   const config = await resolveSigninConfig(env);
   if (!config.relayServerId || config.relayServerId !== serverId) {
     return { done: false, retry: false, kind: 'error', message: '该服务器不是签到代发服务器' };
@@ -507,7 +524,7 @@ export async function reportRelayResult(env, serverId, httpStatus, body, now = D
     if (!Number.isInteger(status) || status <= 0) {
       throw new SigninError(`代发服务器请求 NodeSeek 失败：${String(body || '').slice(0, 200) || '无响应'}`, 'error');
     }
-    recordSuccess(state, date, interpretAttendanceResponse(status, String(body || '').slice(0, MAX_RELAY_BODY)), now, 'relay');
+    recordSuccess(state, date, interpretAttendanceResponse(status, String(body || '').slice(0, MAX_RELAY_BODY), { location }), now, 'relay');
   } catch (e) {
     kind = await recordFailure(env, state, e, { date, now, trigger: 'relay', dryRun: false, relay: true });
   }

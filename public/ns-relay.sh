@@ -10,6 +10,7 @@
 # 其他命令：
 #   cfsm-ns-relay run [--force]   立即执行（--force 忽略签到时间，但不会重复签到）
 #   cfsm-ns-relay check           只检查与面板的连接和今日任务，不签到
+#   cfsm-ns-relay update          从面板更新本脚本
 #   cfsm-ns-relay uninstall       卸载
 
 set -u
@@ -77,6 +78,9 @@ panel_request() {
         if [ -n "${RELAY_STATUS:-}" ]; then
             printf 'header = "X-Relay-Status: %s"\n' "$RELAY_STATUS"
         fi
+        if [ -n "${RELAY_LOCATION:-}" ]; then
+            printf 'header = "X-Relay-Location: %s"\n' "$RELAY_LOCATION"
+        fi
         printf 'header = "Content-Type: text/plain; charset=utf-8"\n'
         if [ -z "$body_file" ]; then
             printf 'data = ""\n'
@@ -108,14 +112,19 @@ do_signin() {
         printf 'header = "Origin: %s"\n' "$NS_ORIGIN"
         printf 'header = "Referer: %s/board"\n' "$NS_ORIGIN"
         printf 'data = ""\n'
-    } | curl -4 -sS -m 30 --connect-timeout 10 -o "$body_file" -w '%{http_code}' -K - 2>"$body_file.err"
+    } | curl -4 -sS -m 30 --connect-timeout 10 -D "$body_file.hdr" -o "$body_file" -w '%{http_code}' -K - 2>"$body_file.err"
+}
+
+# 从响应头中取出跳转地址（去掉回车、引号，最长 300 字符）
+redirect_location() {
+    sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$1" 2>/dev/null | tail -n 1 | tr -d '\r"\\' | cut -c1-300
 }
 
 cmd_run() {
     load_config
     mkdir "$LOCK_DIR" 2>/dev/null || die "已有任务在运行（如确认没有，可删除 $LOCK_DIR）"
     tmp_body="$(mktemp "${TMPDIR:-/tmp}/cfsm-ns.XXXXXX")" || { rmdir "$LOCK_DIR"; die "无法创建临时文件"; }
-    trap 'rm -f "$tmp_body" "$tmp_body.err" "$tmp_body.report"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+    trap 'rm -f "$tmp_body" "$tmp_body.err" "$tmp_body.report" "$tmp_body.hdr"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
 
     mode="${1:-}"
     attempt=1
@@ -143,9 +152,11 @@ cmd_run() {
         else
             head -c 65536 "$tmp_body" > "$tmp_body.report" 2>/dev/null
             RELAY_STATUS="$code"
+            RELAY_LOCATION="$(redirect_location "$tmp_body.hdr")"
         fi
         result="$(panel_request "/relay/nodeseek/report" "$tmp_body.report")" || die "签到已发出，但回传结果到面板失败"
         RELAY_STATUS=""
+        RELAY_LOCATION=""
         log "结果：$(field kind "$result") $(field message "$result")"
 
         if [ "$(field done "$result")" = "1" ]; then
@@ -174,10 +185,21 @@ cmd_check() {
         die "面板拒绝请求：$(field error "$task")"
     fi
     log "面板连接正常。今日任务：due=$(field due "$task") $(field reason "$task")"
-    if command -v curl >/dev/null 2>&1; then
-        ns_code="$(curl -4 -sS -o /dev/null -m 15 -w '%{http_code}' "$NS_ORIGIN/" 2>/dev/null || echo 000)"
-        log "本机 IPv4 访问 NodeSeek：HTTP $ns_code"
-    fi
+    ns_code="$(curl -4 -sS -o /dev/null -m 15 -A "$USER_AGENT" -w '%{http_code}' "$NS_ORIGIN/" 2>/dev/null || echo 000)"
+    log "本机 IPv4 访问 NodeSeek 首页：HTTP $ns_code"
+
+    # 不带 Cookie 调用签到接口：正常应返回 USER NOT FOUND（说明本机 IP 未被拦截）
+    probe="$(mktemp "${TMPDIR:-/tmp}/cfsm-ns-probe.XXXXXX")" || return 0
+    probe_code="$(curl -4 -sS -m 15 -X POST -A "$USER_AGENT" -H "Origin: $NS_ORIGIN" -H "Referer: $NS_ORIGIN/board" \
+        -D "$probe.hdr" -o "$probe" -w '%{http_code}' "$NS_ORIGIN/api/attendance?random=true" 2>/dev/null || echo 000)"
+    probe_location="$(redirect_location "$probe.hdr")"
+    probe_body="$(head -c 160 "$probe" 2>/dev/null | tr '\r\n' '  ')"
+    rm -f "$probe" "$probe.hdr"
+    log "无 Cookie 探测签到接口：HTTP $probe_code${probe_location:+ 跳转到 $probe_location} $probe_body"
+    case "$probe_body" in
+        *"USER NOT FOUND"*) log "判断：本机 IP 可以访问签到接口，问题在 Cookie 或请求本身" ;;
+        *) log "判断：本机 IP 可能被 NodeSeek 风控拦截" ;;
+    esac
 }
 
 # 北京时间 HH:MM 转为本机时区的 crontab 分、时
@@ -252,6 +274,16 @@ cmd_check_inline() {
     fi
 }
 
+# 从面板下载最新版脚本覆盖本机副本（配置与 crontab 保持不变）
+cmd_update() {
+    load_config
+    curl -fsSL -m 60 "$RELAY_URL/ns-relay.sh" -o "$BIN_FILE.tmp" || die "下载失败：$RELAY_URL/ns-relay.sh"
+    head -n 1 "$BIN_FILE.tmp" | grep -q '^#!/bin/sh' || { rm -f "$BIN_FILE.tmp"; die "下载内容不是脚本"; }
+    mv "$BIN_FILE.tmp" "$BIN_FILE"
+    chmod 700 "$BIN_FILE"
+    log "已更新：$BIN_FILE"
+}
+
 cmd_uninstall() {
     if command -v crontab >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab - 2>/dev/null || true
@@ -268,6 +300,7 @@ case "${1:-}" in
         if [ "${1:-}" = "--force" ]; then cmd_run force; else cmd_run; fi
         ;;
     check) cmd_check ;;
+    update) cmd_update ;;
     uninstall) cmd_uninstall ;;
     *)
         printf '用法：%s install|run [--force]|check|uninstall\n' "$0"
