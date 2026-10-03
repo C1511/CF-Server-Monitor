@@ -419,8 +419,30 @@ export async function clearSingboxConns(env) {
   await env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(CONN_KEY).run();
 }
 
-// 首页（仅管理员）展示的连接分流记录
-export async function buildSingboxConnView(env, now = Date.now()) {
+export const CONN_PAGE_DEFAULT = 50;
+
+// 与首页搜索框一致：目标、IP、规则、出站、来源、入站、端口中包含关键字（不区分大小写）；out 为出站精确匹配
+export function filterConns(list, { q = '', out = '' } = {}) {
+  const keyword = String(q || '').trim().toLowerCase();
+  return list.filter(c => {
+    if (out && c.out !== out) return false;
+    if (!keyword) return true;
+    return [c.host, c.ip, c.rule, c.out, c.src, c.in, c.port].some(v => String(v || '').toLowerCase().includes(keyword));
+  });
+}
+
+function pageOf(list, filter, limit) {
+  const matched = filterConns(list, filter);
+  return { items: matched.slice(0, limit), matched: matched.length, total: list.length };
+}
+
+/**
+ * 首页（仅管理员）展示的连接分流记录
+ * 只返回筛选后的前 limit 条（默认 50），避免每次刷新都下载全部记录
+ */
+export async function buildSingboxConnView(env, now = Date.now(), { limit = CONN_PAGE_DEFAULT, q = '', out = '' } = {}) {
+  const size = Math.min(MAX_CONN_RECORDS, Math.max(1, Math.floor(Number(limit)) || CONN_PAGE_DEFAULT));
+  const filter = { q: String(q || '').slice(0, 200), out: String(out || '').slice(0, 128) };
   const options = await loadSingboxOptions(env.DB);
   if (!options.server_id) return { enabled: false };
   const [log, server] = await Promise.all([
@@ -428,14 +450,21 @@ export async function buildSingboxConnView(env, now = Date.now()) {
     env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(options.server_id).first().catch(() => null)
   ]);
   const stats = log.stats?.date === beijingDate(now) ? log.stats : null;
+  const records = pageOf(log.records, filter, size);
+  const active = pageOf(log.active, filter, size);
   return {
     enabled: true,
     recording: options.conn_log,
     server: { id: options.server_id, name: server?.name || options.server_id },
     updated_at: log.updated_at,
     totals: log.totals,
-    active: log.active,
-    records: log.records,
+    // *_matched：符合筛选条件的条数；*_total：全部条数
+    records: records.items,
+    records_matched: records.matched,
+    records_total: records.total,
+    active: active.items,
+    active_matched: active.matched,
+    active_total: active.total,
     stats: stats
       ? {
         date: stats.date,

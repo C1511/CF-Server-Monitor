@@ -470,8 +470,14 @@ export { isAdminLoggedIn }
 
 // 自动任务摘要（阿里云保活 / NodeSeek 签到）；未配置或无权限时返回 null
 // sing-box 连接分流记录（仅管理员；未登录返回 null）
-export const fetchSingboxConnections = async (apiIndex = 0) => {
-  const result = await http.getByIndex('/api/singbox/connections', apiIndex, { includeAuth: true, autoRedirect: false })
+// params：limit 条数、q 关键字、out 出站（筛选在服务器端完成）
+export const fetchSingboxConnections = async (params = {}, apiIndex = 0) => {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== '' && value !== null && value !== undefined) query.set(key, String(value))
+  }
+  const path = `/api/singbox/connections${query.toString() ? `?${query}` : ''}`
+  const result = await http.getByIndex(path, apiIndex, { includeAuth: true, autoRedirect: false })
   if (result.error || !result.data) return null
   return result.data
 }

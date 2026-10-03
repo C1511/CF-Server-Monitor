@@ -249,7 +249,9 @@ test('connection log: capped, can be turned off, and dropped when switching serv
   const env = await singboxEnv();
   const many = Array.from({ length: MAX_CONN_RECORDS + 50 }, (_, i) => conn(`h${i}.com`, 'warp'));
   await reportSingboxConns(env, 'srv-hk', JSON.stringify({ closed: many }), T0);
-  assert.equal((await buildSingboxConnView(env, T0)).records.length, MAX_CONN_RECORDS);
+  const full = await buildSingboxConnView(env, T0, { limit: 5000 });
+  assert.equal(full.records.length, MAX_CONN_RECORDS);
+  assert.equal(full.records_total, MAX_CONN_RECORDS);
 
   assert.equal((await pollSingboxRoute(env, 'srv-hk', '', T0)).connLog, true, 'on by default');
   await setSingboxConnLog(env, false);
@@ -262,4 +264,28 @@ test('connection log: capped, can be turned off, and dropped when switching serv
   assert.equal((await buildSingboxConnView(env, T0)).records.length, 0, 'old server records dropped');
   await setSingboxServer(env, null);
   assert.equal((await buildSingboxConnView(env, T0)).enabled, false);
+});
+
+test('connection view: returns one page at a time and filters on the server', async () => {
+  const env = await singboxEnv();
+  const closed = Array.from({ length: 120 }, (_, i) => conn(i % 3 === 0 ? `v${i}.netflix.com` : `s${i}.example.com`, i % 3 === 0 ? 'warp' : 'direct'));
+  await reportSingboxConns(env, 'srv-hk', JSON.stringify({ closed, active: [conn('chat.openai.com', 'warp')] }), T0);
+
+  const first = await buildSingboxConnView(env, T0);
+  assert.equal(first.records.length, 50, 'default page');
+  assert.equal(first.records_matched, 120);
+  assert.equal(first.records_total, 120);
+  assert.equal((await buildSingboxConnView(env, T0, { limit: 100 })).records.length, 100);
+  assert.equal((await buildSingboxConnView(env, T0, { limit: 'abc' })).records.length, 50, 'bad limit falls back');
+
+  const warp = await buildSingboxConnView(env, T0, { out: 'warp' });
+  assert.equal(warp.records_matched, 40);
+  assert.ok(warp.records.every(r => r.out === 'warp'));
+  assert.equal(warp.records_total, 120, 'total ignores the filter');
+
+  const search = await buildSingboxConnView(env, T0, { q: 'NETFLIX' });
+  assert.equal(search.records_matched, 40, 'case-insensitive, matches host and rule');
+  assert.equal(search.active_matched, 0);
+  assert.equal((await buildSingboxConnView(env, T0, { q: 'openai' })).active.length, 1);
+  assert.equal((await buildSingboxConnView(env, T0, { q: 'nothing-here' })).records.length, 0);
 });

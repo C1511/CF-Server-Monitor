@@ -362,7 +362,11 @@ export default {
         // 连接分流记录会暴露访问了哪些网站，只对已登录管理员开放
         await ensureSiteSettings();
         if (!await checkAuth(request, env, sys)) return createUnauthorizedResponse();
-        return createSuccessResponse(await buildSingboxConnView(env), { 'Cache-Control': 'no-store' });
+        return createSuccessResponse(await buildSingboxConnView(env, Date.now(), {
+          limit: url.searchParams.get('limit'),
+          q: url.searchParams.get('q') || '',
+          out: url.searchParams.get('out') || ''
+        }), { 'Cache-Control': 'no-store' });
       }},
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {

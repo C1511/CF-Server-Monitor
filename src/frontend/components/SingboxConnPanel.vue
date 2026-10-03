@@ -17,7 +17,7 @@
           <div class="sbc-stat-label">{{ trans.sbcTodayConns }}</div>
         </div>
         <div class="sbc-stat">
-          <div class="sbc-stat-value">{{ view.active?.length || 0 }}</div>
+          <div class="sbc-stat-value">{{ view.active_total ?? 0 }}</div>
           <div class="sbc-stat-label">{{ trans.sbcActiveConns }}</div>
         </div>
         <div class="sbc-stat">
@@ -44,15 +44,16 @@
 
       <div class="sbc-toolbar">
         <div class="sbc-tabs" role="tablist">
-          <button role="tab" :aria-selected="tab === 'records'" :class="{ active: tab === 'records' }" @click="tab = 'records'">{{ trans.sbcTabRecords }} ({{ view.records?.length || 0 }})</button>
-          <button role="tab" :aria-selected="tab === 'active'" :class="{ active: tab === 'active' }" @click="tab = 'active'">{{ trans.sbcTabActive }} ({{ view.active?.length || 0 }})</button>
+          <button role="tab" :aria-selected="tab === 'records'" :class="{ active: tab === 'records' }" @click="tab = 'records'">{{ trans.sbcTabRecords }} ({{ view.records_total ?? 0 }})</button>
+          <button role="tab" :aria-selected="tab === 'active'" :class="{ active: tab === 'active' }" @click="tab = 'active'">{{ trans.sbcTabActive }} ({{ view.active_total ?? 0 }})</button>
           <button role="tab" :aria-selected="tab === 'hosts'" :class="{ active: tab === 'hosts' }" @click="tab = 'hosts'">{{ trans.sbcTabHosts }}</button>
         </div>
         <input v-model.trim="search" class="sbc-search" type="search" :placeholder="trans.sbcSearch" :aria-label="trans.sbcSearch" />
       </div>
 
       <template v-if="tab !== 'hosts'">
-        <div v-if="filteredConns.length" class="sbc-table-wrap">
+        <p v-if="filtering && conns.length" class="sbc-matched">{{ trans.sbcMatched.replace('{n}', matchedCount) }}</p>
+        <div v-if="conns.length" class="sbc-table-wrap">
           <table class="sbc-table">
             <thead>
               <tr>
@@ -66,7 +67,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(c, i) in visibleConns" :key="i">
+              <tr v-for="(c, i) in conns" :key="i">
                 <td class="nowrap" :title="fullTime(c)">{{ shortTime(tab === 'active' ? c.start : c.end) }}</td>
                 <td class="sbc-target" :title="c.ip && c.ip !== c.host ? c.ip : ''">
                   {{ c.host || c.ip }}<span class="sbc-port">:{{ c.port }}</span>
@@ -84,7 +85,9 @@
           </table>
         </div>
         <p v-else class="sbc-empty">{{ emptyText }}</p>
-        <button v-if="filteredConns.length > limit" class="sbc-more" @click="limit += PAGE">{{ trans.sbcShowMore }} ({{ filteredConns.length - limit }})</button>
+        <button v-if="remaining > 0" class="sbc-more" :disabled="loadingMore" @click="showMore">
+          {{ loadingMore ? trans.sbcLoading : `${trans.sbcShowMore} (${remaining})` }}
+        </button>
       </template>
 
       <template v-else>
@@ -194,18 +197,11 @@ const ruleText = (rule) => {
 const inboundText = (value) => String(value || '').split('/').pop()
 const chainText = (c) => (c.chain?.length > 1 ? [...c.chain].reverse().join(' → ') : c.out)
 
-const matches = (c) => {
-  if (outFilter.value && c.out !== outFilter.value) return false
-  if (!search.value) return true
-  const q = search.value.toLowerCase()
-  return [c.host, c.ip, c.rule, c.out, c.src, c.in, c.port].some(v => String(v || '').toLowerCase().includes(q))
-}
-
-const filteredConns = computed(() => {
-  const list = tab.value === 'active' ? view.value?.active : view.value?.records
-  return (list || []).filter(matches)
-})
-const visibleConns = computed(() => filteredConns.value.slice(0, limit.value))
+// 连接列表的筛选和分页在服务器端完成，这里直接显示返回的条目
+const conns = computed(() => (tab.value === 'active' ? view.value?.active : view.value?.records) || [])
+const matchedCount = computed(() => (tab.value === 'active' ? view.value?.active_matched : view.value?.records_matched) ?? 0)
+const remaining = computed(() => Math.max(0, matchedCount.value - conns.value.length))
+const filtering = computed(() => Boolean(search.value || outFilter.value))
 
 const filteredHosts = computed(() => (stats.value?.hosts || []).filter(h => {
   if (outFilter.value && h.out !== outFilter.value) return false
@@ -227,17 +223,41 @@ const updatedText = computed(() => {
   return `${trans.value.sbcUpdated} ${shortTime(at)}`
 })
 
-watch([tab, search, outFilter], () => {
+// 换标签、筛选条件变化时回到第一页并立即刷新；输入关键字时稍等再请求
+let searchTimer = null
+watch([tab, outFilter], () => {
   limit.value = PAGE
+  schedule(0)
 })
+watch(search, () => {
+  limit.value = PAGE
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => schedule(0), 300)
+})
+
+const loadingMore = ref(false)
+const showMore = async () => {
+  limit.value += PAGE
+  loadingMore.value = true
+  try {
+    await load()
+  } finally {
+    loadingMore.value = false
+  }
+  schedule(collapsed.value ? CLOSED_POLL_MS : OPEN_POLL_MS)
+}
 
 // ---- 刷新：展开且页面可见时 5 秒一次；未登录（401）时停止 ----
 let timer = null
 let stopped = false
 let clock = null
+let requestSeq = 0
 
 const load = async () => {
-  const data = await fetchSingboxConnections()
+  const seq = ++requestSeq
+  const data = await fetchSingboxConnections({ limit: limit.value, q: search.value, out: outFilter.value })
+  // 筛选条件变化后，旧请求的结果直接丢弃
+  if (seq !== requestSeq) return
   if (data === null) {
     // 未登录或接口不可用：不显示，也不再请求
     view.value = null
@@ -270,6 +290,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   clearTimeout(timer)
+  clearTimeout(searchTimer)
   clearInterval(clock)
   document.removeEventListener('visibilitychange', onVisible)
 })
@@ -525,6 +546,17 @@ onUnmounted(() => {
   margin: 10px 0 0;
   color: var(--text-secondary);
   font-size: 12px;
+}
+
+.sbc-matched {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.sbc-more:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .sbc-more {
