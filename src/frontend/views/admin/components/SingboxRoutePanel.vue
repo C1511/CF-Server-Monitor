@@ -217,7 +217,7 @@ const installCommand = computed(() => {
   const server = servers.value.find(s => s.id === serverId.value)
   if (!server?.agent_secret) return ''
   const origin = window.location.origin
-  return `curl -fsSL ${origin}/singbox-agent.sh | sudo CFSM_RELAY_SECRET='${server.agent_secret}' sh -s -- install --url=${origin} --id=${serverId.value}`
+  return `curl -fsSL ${origin}/singbox-agent.sh | CFSM_RELAY_SECRET='${server.agent_secret}' sh -s -- install --url=${origin} --id=${serverId.value}`
 })
 
 const copyInstall = async () => {
