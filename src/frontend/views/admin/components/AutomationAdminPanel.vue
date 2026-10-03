@@ -173,7 +173,6 @@
           <div><span>{{ trans.signinStreak }}</span><b>{{ signin.streak }} {{ trans.signinDays }}</b></div>
           <div><span>{{ trans.signinMonthGain }}</span><b>{{ signin.month_gain }}</b></div>
           <div><span>{{ trans.signinSchedule }}</span><b>{{ signin.config.schedule }}</b></div>
-          <div><span>{{ trans.signinRandom }}</span><b>{{ signin.config.random ? trans.yes : trans.no }}</b></div>
           <div><span>{{ trans.signinAttempts }}</span><b>{{ signin.attempts?.count ?? 0 }}</b></div>
           <div><span>{{ trans.lastCheck }}</span><b>{{ formatDateTime(signin.last_checked_at) }}</b></div>
         </div>

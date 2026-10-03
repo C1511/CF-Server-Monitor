@@ -267,9 +267,8 @@ docker rm -f cf-probe && docker volume rm cf-probe-data
 | `ALIYUN_CDT_THRESHOLD_GB` | 否 | 非内地 CDT 流量阈值，默认 `190`；低于阈值开机，达到阈值关机。也可在后台「自动任务」中直接修改（后台设置优先） |
 | `ALIYUN_CHECK_INTERVAL_MINUTES` | 否 | 检查间隔（1-60 分钟），默认 `10` |
 | `ALIYUN_BSS_ENDPOINT` | 否 | 账单接口域名，默认 `business.aliyuncs.com`；国际站填 `business.ap-southeast-1.aliyuncs.com`。账单每小时刷新，余额和消费仅对已登录管理员显示 |
-| 🔐 `NS_COOKIE` | 启用签到时必填 | NodeSeek 登录 Cookie 整串 |
+| 🔐 `NS_COOKIE` | 启用签到时必填 | NodeSeek 登录 Cookie 整串；签到固定领取 5 个鸡腿（不试手气） |
 | `NS_SIGNIN_TIME` | 否 | 每日签到时间（北京时间 `HH:MM`），默认 `08:37`；失败每 30 分钟重试，每天最多 3 次 |
-| `NS_SIGNIN_RANDOM` | 否 | 是否使用「试试手气」，默认 `true` |
 
 开关机、CDT 达到 90%、检查失败、签到失败会通过后台已配置的通知渠道（Telegram / Webhook / 邮件）推送。
 

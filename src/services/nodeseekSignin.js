@@ -1,6 +1,6 @@
 /**
  * NodeSeek 每日签到（移植自独立的 nodeseek-signin-worker）
- * 直接 POST /api/attendance?random=true（"试试手气"），以返回结果为准；接口本身幂等，一天只会成功一次
+ * 直接 POST /api/attendance?random=false（固定领取 5 个鸡腿，不试手气），以返回结果为准；接口本身幂等，一天只会成功一次
  * "检查状态"使用 GET /api/attendance/board，只查询不签到
  *
  * Cookie 来源（优先级从高到低）：
@@ -13,7 +13,6 @@
  *
  * 其他环境变量：
  *   NS_SIGNIN_TIME    每日签到时间（北京时间 HH:MM），默认 08:37
- *   NS_SIGNIN_RANDOM  是否使用"试试手气"，默认 true；false 时为固定奖励
  */
 import { loadSiteSettings, normalizeBooleanSetting } from '../utils/settings.js';
 import { sendNotification } from './notification.js';
@@ -49,8 +48,7 @@ export function getSigninConfig(env = {}) {
     enabled: Boolean(cookie),
     cookie,
     cookieSource: cookie ? 'env' : '',
-    ...parseSchedule(env),
-    random: String(env.NS_SIGNIN_RANDOM ?? 'true').trim().toLowerCase() !== 'false'
+    ...parseSchedule(env)
   };
 }
 
@@ -459,7 +457,7 @@ export async function runNodeseekSignin(env, { dryRun = false, trigger = 'cron',
         recordSuccess(state, date, { status: 'pending', gain: null, current: null, message: 'Cookie 有效，今日尚未签到' }, now, trigger);
       }
     } else {
-      const resp = await fetch(`${NS_ORIGIN}/api/attendance?random=${config.random}`, {
+      const resp = await fetch(`${NS_ORIGIN}/api/attendance?random=false`, {
         method: 'POST',
         headers: nsHeaders(config)
       });
@@ -518,7 +516,8 @@ export async function getRelayTask(env, serverId, { force = false, stats = false
   if (!force && attempts >= MAX_ATTEMPTS_PER_DAY) return { due: false, reason: 'max_attempts' };
   if (!force && beijingMinutesOfDay(now) < config.hour * 60 + config.minute) return { due: false, reason: 'too_early' };
 
-  return { due: true, cookie: sanitizeCookie(config.cookie), random: config.random, attempt: attempts + 1 };
+  // random 固定为 false（不试手气）；保留该字段，旧版 ns-relay.sh 缺省时会按 true 处理
+  return { due: true, cookie: sanitizeCookie(config.cookie), random: false, attempt: attempts + 1 };
 }
 
 // 代发服务器回传 NodeSeek 的原始响应，由面板判定结果
@@ -776,7 +775,6 @@ export function buildSigninAdminView(config, state, now = Date.now()) {
     enabled: Boolean(config?.enabled),
     config: {
       schedule: `${formatTime(config.hour, config.minute)}（北京时间）`,
-      random: config.random,
       has_cookie: Boolean(config.cookie),
       cookie_source: config.cookieSource || '',
       cookie_updated_at: config.cookieUpdatedAt || null,

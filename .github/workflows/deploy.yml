@@ -58,7 +58,6 @@ jobs:
           ALIYUN_CHECK_INTERVAL_MINUTES: ${{ secrets.ALIYUN_CHECK_INTERVAL_MINUTES }}
           ALIYUN_BSS_ENDPOINT: ${{ secrets.ALIYUN_BSS_ENDPOINT }}
           NS_SIGNIN_TIME: ${{ secrets.NS_SIGNIN_TIME }}
-          NS_SIGNIN_RANDOM: ${{ secrets.NS_SIGNIN_RANDOM }}
         run: |
           cat > wrangler.toml << 'WEOF'
           name = "server-monitor-pro"
@@ -98,7 +97,7 @@ jobs:
             const e = process.env;
             // 自动任务的可选配置，未设置时不写入，使用代码默认值
             const optional = ["ALIYUN_REGION_ID", "ALIYUN_ECS_INSTANCE_ID", "ALIYUN_CDT_THRESHOLD_GB",
-              "ALIYUN_CHECK_INTERVAL_MINUTES", "ALIYUN_BSS_ENDPOINT", "NS_SIGNIN_TIME", "NS_SIGNIN_RANDOM"]
+              "ALIYUN_CHECK_INTERVAL_MINUTES", "ALIYUN_BSS_ENDPOINT", "NS_SIGNIN_TIME"]
               .filter(k => String(e[k] || "").trim() !== "")
               .map(k => k + " = " + q(String(e[k]).trim()));
             fs.appendFileSync("wrangler.toml", [

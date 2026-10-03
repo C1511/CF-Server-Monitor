@@ -133,10 +133,10 @@ fetch_credit() {
 
 signin_request() {
     cookie="$1"
-    random="$2"
-    body_file="$3"
+    body_file="$2"
     {
-        printf 'url = "%s/api/attendance?random=%s"\n' "$NS_ORIGIN" "$random"
+        # random=false：固定领取 5 个鸡腿，不试手气
+        printf 'url = "%s/api/attendance?random=false"\n' "$NS_ORIGIN"
         printf 'header = "Cookie: %s"\n' "$(curl_quote "$cookie")"
         printf 'header = "User-Agent: %s"\n' "$USER_AGENT"
         printf 'header = "Accept: application/json, text/plain, */*"\n'
@@ -171,16 +171,16 @@ do_signin() {
     current="$1"
     hops=0
     while :; do
-        SIGNIN_CODE="$(signin_request "$current" "$2" "$3")" || SIGNIN_CODE="000"
+        SIGNIN_CODE="$(signin_request "$current" "$2")" || SIGNIN_CODE="000"
         case "$SIGNIN_CODE" in
             301|302|303|307|308) ;;
             *) break ;;
         esac
-        case "$(redirect_location "$3.hdr")" in
+        case "$(redirect_location "$2.hdr")" in
             */api/attendance*|/api/attendance*) ;;
             *) break ;;
         esac
-        fresh="$(set_cookie_pairs "$3.hdr")"
+        fresh="$(set_cookie_pairs "$2.hdr")"
         [ -n "$fresh" ] || break
         hops=$((hops + 1))
         [ "$hops" -le 2 ] || break
@@ -216,10 +216,8 @@ cmd_run() {
         fi
 
         cookie="$(field cookie "$task")"
-        random="$(field random "$task")"
-        [ "$random" = "false" ] || random="true"
-        log "第 ${attempt} 次签到（IPv4）..."
-        do_signin "$cookie" "$random" "$tmp_body"
+        log "第 ${attempt} 次签到（IPv4，固定 5 鸡腿）..."
+        do_signin "$cookie" "$tmp_body"
         code="$SIGNIN_CODE"
         stats_cookie="${SIGNIN_COOKIE:-$cookie}"
         cookie=""
@@ -275,7 +273,7 @@ cmd_check() {
     # 不带 Cookie 调用签到接口：正常应返回 USER NOT FOUND（说明本机 IP 未被拦截）
     probe="$(mktemp "${TMPDIR:-/tmp}/cfsm-ns-probe.XXXXXX")" || return 0
     probe_code="$(curl -4 -sS -m 15 -X POST -A "$USER_AGENT" -H "Origin: $NS_ORIGIN" -H "Referer: $NS_ORIGIN/board" \
-        -D "$probe.hdr" -o "$probe" -w '%{http_code}' "$NS_ORIGIN/api/attendance?random=true" 2>/dev/null || echo 000)"
+        -D "$probe.hdr" -o "$probe" -w '%{http_code}' "$NS_ORIGIN/api/attendance?random=false" 2>/dev/null || echo 000)"
     probe_location="$(redirect_location "$probe.hdr")"
     probe_body="$(head -c 160 "$probe" 2>/dev/null | tr '\r\n' '  ')"
     rm -f "$probe" "$probe.hdr"

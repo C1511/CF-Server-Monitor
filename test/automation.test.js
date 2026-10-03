@@ -372,7 +372,7 @@ test('signin posts directly and records gain; the board is not needed for a real
     const state = await runNodeseekSignin(env, { now: AFTER_SCHEDULE });
     assert.equal(f.calls.some(c => c.url.pathname === '/api/attendance/board'), false);
     const post = f.calls.find(c => c.init.method === 'POST');
-    assert.equal(post.url.searchParams.get('random'), 'true');
+    assert.equal(post.url.searchParams.get('random'), 'false', 'fixed 5-drumstick reward, no lucky draw');
     assert.equal(post.init.headers.Cookie, 'session=abc');
     assert.deepEqual([state.today.status, state.today.gain, state.today.current], ['success', 7, 120]);
     assert.equal(state.failure_kind, '');
@@ -818,7 +818,7 @@ test('credit records fill balance, today gain and back-fill this month\'s check-
 });
 
 test('admin view only shows today\'s check-in detail', async () => {
-  const config = { enabled: true, hour: 8, minute: 37, random: true, cookie: 'c' };
+  const config = { enabled: true, hour: 8, minute: 37, cookie: 'c' };
   const state = { history: [], today: { date: '2026-10-01', status: 'already', message: '今天已完成签到，请勿重复操作' } };
   assert.equal(buildSigninAdminView(config, state, AFTER_SCHEDULE).detail, null);
 });
