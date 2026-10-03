@@ -101,6 +101,11 @@
           >{{ trans.automation }}</button>
           <button
             class="tab-btn"
+            :class="{ active: activeTab === 'singbox' }"
+            @click="activeTab = 'singbox'"
+          >{{ trans.singboxTab }}</button>
+          <button
+            class="tab-btn"
             :class="{ active: activeTab === 'themeStore' }"
             @click="activeTab = 'themeStore'"
           >{{ trans.themeStore }}</button>
@@ -175,6 +180,13 @@
         />
 
         <AutomationAdminPanel
+          :trans="trans"
+          :active-tab="activeTab"
+          :selected-api-index="selectedApiIndex"
+          @alert-message="alertMessage = $event"
+        />
+
+        <SingboxRoutePanel
           :trans="trans"
           :active-tab="activeTab"
           :selected-api-index="selectedApiIndex"
@@ -598,6 +610,7 @@ import ServerTable from './components/ServerTable.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import DatabasePanel from './components/DatabasePanel.vue'
 import AutomationAdminPanel from './components/AutomationAdminPanel.vue'
+import SingboxRoutePanel from './components/SingboxRoutePanel.vue'
 import ThemeStorePanel from './components/ThemeStorePanel.vue'
 import DonationPanel from './components/DonationPanel.vue'
 import EditServerModal from './components/EditServerModal.vue'

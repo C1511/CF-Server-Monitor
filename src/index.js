@@ -12,6 +12,7 @@ import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
 import { buildSigninPublicView, formatRelayText, getRelayTask, loadSigninState, reportRelayCredit, reportRelayResult, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
+import { pollSingboxRoute, reportSingbox } from './services/singboxRoute.js';
 import { verifyAgentSecret } from './utils/agentSecret.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
@@ -331,6 +332,26 @@ export default {
           refreshedCookie: request.headers.get('X-Relay-Cookie') || ''
         });
         return relayTextResponse({ done: result.done ? 1 : 0, retry: result.retry ? 1 : 0, kind: result.kind, message: result.message });
+      }},
+      { method: 'POST', path: '/relay/singbox/poll', handler: async () => {
+        // sing-box 服务器轮询：204 无变更；200 返回需要应用的 route（JSON），版本号放在响应头
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const result = await pollSingboxRoute(env, serverId, request.headers.get('X-Applied-Rev'));
+        if (result.status !== 200) {
+          return result.error
+            ? relayTextResponse({ error: result.error }, result.status)
+            : new Response(null, { status: result.status, headers: { 'Cache-Control': 'no-store' } });
+        }
+        return new Response(JSON.stringify(result.route), {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Route-Rev': result.rev }
+        });
+      }},
+      { method: 'POST', path: '/relay/singbox/report', handler: async () => {
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const result = await reportSingbox(env, serverId, await request.text());
+        return relayTextResponse(result.error ? { error: result.error } : { ok: 1 }, result.status);
       }},
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {

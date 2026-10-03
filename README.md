@@ -277,6 +277,15 @@ docker rm -f cf-probe && docker volume rm cf-probe-data
 它只在签到时间由 crontab 触发一次，向面板领取任务、用 IPv4 发起签到并回传结果；失败最多重试 3 次（Cookie 失效不重试）。
 Cookie 仍加密保存在面板（可在后台随时更新），鉴权使用该服务器自己的上报密钥。NodeSeek 登录需要人机验证，因此不支持账号密码自动登录。
 
+### sing-box 分流规则在线修改
+
+在后台「sing-box 分流」标签页中选择运行 sing-box 的服务器，按页面给出的命令在该服务器上以 root 安装 `singbox-agent.sh`（会自动安装 jq，并注册 systemd 服务 `cfsm-singbox`）。之后即可在面板中直接编辑 sing-box 配置里的 `route` 段：
+
+- 可视化模式：域名后缀/关键字/正则、geosite、geoip、IP 段、端口、入站 tag、嗅探协议等规则，动作可选出站或 reject / hijack-dns / sniff，可调整顺序和最终出站；geosite / geoip 会自动添加 SagerNet 官方 rule-set。逻辑规则等复杂规则以 JSON 行保留；JSON 模式可编辑整个 `route`。
+- 保存后，服务器上的脚本在下一次轮询（默认每 10 秒）拉取新版本：只替换 `route` 段 → `sing-box check` → 重启 sing-box → 观察约 10 秒；检查不通过或启动失败会自动恢复原配置，结果实时显示在面板中。
+- 面板只收到入站/出站的 tag 与类型和 `route` 段，密码、证书等不会离开服务器；鉴权使用该服务器自己的上报密钥。保存时会拦截服务器上不存在的出站 tag（sing-box check 不检查这一项）。
+- 配置文件从 sing-box 的 systemd 启动参数中自动识别（支持 `-c` 和 `-C` 目录）；识别失败时安装命令追加 `--config=/路径`。服务器上可用 `cfsm-singbox status | sync | update | uninstall` 管理。注意：应用后配置文件会被重新格式化（注释会被去掉）。
+
 
 ### GitHub Pages 静态前台
 

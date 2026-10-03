@@ -14,6 +14,7 @@ import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../u
 import { deriveAgentSecret } from '../utils/agentSecret.js';
 import { buildAdminView, loadKeepaliveState, resolveAliyunConfig, runAliyunKeepalive, setAliyunKeepalivePaused, setAliyunThreshold } from '../services/aliyunKeepalive.js';
 import { buildSigninAdminView, loadSigninState, resolveSigninConfig, runNodeseekSignin, setSigninCookie, setSigninRelay } from '../services/nodeseekSignin.js';
+import { buildSingboxAdminView, saveSingboxRoute, setSingboxServer } from '../services/singboxRoute.js';
 import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
@@ -834,7 +835,47 @@ async function handleSigninSetCookieAction({ env, data }) {
   }
 }
 
+async function singboxAdminResponse(env) {
+  return createSuccessResponse({ success: true, ...await buildSingboxAdminView(env) });
+}
+
+async function handleSingboxStatusAction({ env }) {
+  return singboxAdminResponse(env);
+}
+
+// 指定运行 sing-box 的服务器（需为已添加的服务器）；传空值关闭
+async function handleSingboxSetServerAction({ env, data }) {
+  const serverId = String(data.server_id || '').trim();
+  if (serverId) {
+    const exists = await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(serverId).first();
+    if (!exists) return createBadRequestResponse('invalidServerId');
+  }
+  try {
+    await setSingboxServer(env, serverId || null);
+  } catch (e) {
+    if (e?.message === 'invalidServerId') return createBadRequestResponse('invalidServerId');
+    throw e;
+  }
+  return singboxAdminResponse(env);
+}
+
+// 保存期望的 route 段，服务器下次轮询（默认 10 秒内）时自动应用
+async function handleSingboxSaveRouteAction({ env, data }) {
+  try {
+    await saveSingboxRoute(env, data.route);
+  } catch (e) {
+    if (/^route[A-Z]/.test(e?.message || '')) {
+      return createBadRequestResponse(e.detail ? `${e.message}: ${e.detail}` : e.message);
+    }
+    throw e;
+  }
+  return singboxAdminResponse(env);
+}
+
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
+  singbox_status: handleSingboxStatusAction,
+  singbox_set_server: handleSingboxSetServerAction,
+  singbox_save_route: handleSingboxSaveRouteAction,
   signin_status: handleSigninStatusAction,
   signin_check: handleSigninCheckAction,
   signin_run: handleSigninRunAction,
