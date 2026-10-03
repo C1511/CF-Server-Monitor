@@ -14,7 +14,7 @@ import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../u
 import { deriveAgentSecret } from '../utils/agentSecret.js';
 import { buildAdminView, loadKeepaliveState, resolveAliyunConfig, runAliyunKeepalive, setAliyunKeepalivePaused, setAliyunThreshold } from '../services/aliyunKeepalive.js';
 import { buildSigninAdminView, loadSigninState, resolveSigninConfig, runNodeseekSignin, setSigninCookie, setSigninRelay } from '../services/nodeseekSignin.js';
-import { buildSingboxAdminView, saveSingboxRoute, setSingboxServer } from '../services/singboxRoute.js';
+import { buildSingboxAdminView, clearSingboxConns, saveSingboxRoute, setSingboxConnLog, setSingboxServer } from '../services/singboxRoute.js';
 import { clearLoginFailures, getClientIp, isLoginBlocked, recordLoginFailure } from '../utils/loginLimiter.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
@@ -872,7 +872,20 @@ async function handleSingboxSaveRouteAction({ env, data }) {
   return singboxAdminResponse(env);
 }
 
+// 开关连接分流记录
+async function handleSingboxSetConnLogAction({ env, data }) {
+  await setSingboxConnLog(env, data.enabled === true);
+  return singboxAdminResponse(env);
+}
+
+async function handleSingboxClearConnsAction({ env }) {
+  await clearSingboxConns(env);
+  return singboxAdminResponse(env);
+}
+
 const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
+  singbox_set_conn_log: handleSingboxSetConnLogAction,
+  singbox_clear_conns: handleSingboxClearConnsAction,
   singbox_status: handleSingboxStatusAction,
   singbox_set_server: handleSingboxSetServerAction,
   singbox_save_route: handleSingboxSaveRouteAction,

@@ -12,7 +12,7 @@ import { omitNullLossProbeFields } from './handlers/dashboard.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { buildPublicView, loadKeepaliveState, runAliyunKeepaliveIfDue } from './services/aliyunKeepalive.js';
 import { buildSigninPublicView, formatRelayText, getRelayTask, loadSigninState, reportRelayCredit, reportRelayResult, resolveSigninConfig, runNodeseekSigninIfDue } from './services/nodeseekSignin.js';
-import { pollSingboxRoute, reportSingbox } from './services/singboxRoute.js';
+import { buildSingboxConnView, pollSingboxRoute, reportSingbox, reportSingboxConns } from './services/singboxRoute.js';
 import { verifyAgentSecret } from './utils/agentSecret.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache, getCacheDuration } from './utils/cache.js';
 import { AppError, createSuccessResponse, createUnauthorizedResponse, createBadRequestResponse, createNotFoundResponse, createErrorResponse } from './utils/errors.js';
@@ -338,13 +338,12 @@ export default {
         const serverId = await authenticateRelay(request, env);
         if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
         const result = await pollSingboxRoute(env, serverId, request.headers.get('X-Applied-Rev'));
-        if (result.status !== 200) {
-          return result.error
-            ? relayTextResponse({ error: result.error }, result.status)
-            : new Response(null, { status: result.status, headers: { 'Cache-Control': 'no-store' } });
-        }
+        if (result.error) return relayTextResponse({ error: result.error }, result.status);
+        // X-Conn-Log：是否采集连接分流记录
+        const headers = { 'Cache-Control': 'no-store', 'X-Conn-Log': result.connLog ? '1' : '0' };
+        if (result.status !== 200) return new Response(null, { status: result.status, headers });
         return new Response(JSON.stringify(result.route), {
-          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Route-Rev': result.rev }
+          headers: { ...headers, 'Content-Type': 'application/json', 'X-Route-Rev': result.rev }
         });
       }},
       { method: 'POST', path: '/relay/singbox/report', handler: async () => {
@@ -352,6 +351,18 @@ export default {
         if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
         const result = await reportSingbox(env, serverId, await request.text());
         return relayTextResponse(result.error ? { error: result.error } : { ok: 1 }, result.status);
+      }},
+      { method: 'POST', path: '/relay/singbox/conns', handler: async () => {
+        const serverId = await authenticateRelay(request, env);
+        if (!serverId) return relayTextResponse({ error: 'unauthorized' }, 401);
+        const result = await reportSingboxConns(env, serverId, await request.text());
+        return relayTextResponse(result.error ? { error: result.error } : { ok: 1 }, result.status);
+      }},
+      { method: 'GET', path: '/api/singbox/connections', handler: async () => {
+        // 连接分流记录会暴露访问了哪些网站，只对已登录管理员开放
+        await ensureSiteSettings();
+        if (!await checkAuth(request, env, sys)) return createUnauthorizedResponse();
+        return createSuccessResponse(await buildSingboxConnView(env), { 'Cache-Control': 'no-store' });
       }},
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {

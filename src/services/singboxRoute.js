@@ -6,11 +6,21 @@
  * 执行 sing-box check 后重启服务，失败自动回滚，并把结果和当前配置摘要（入站/出站 tag、当前 route）回传。
  *
  * 面板不会拿到配置中的密码、证书等敏感字段：服务器只回传 inbounds/outbounds 的 tag 与类型，以及 route 段。
+ *
+ * 连接分流记录：开启后脚本通过本机 sing-box 的 Clash API 每秒采集连接快照，连接结束时记下目标、命中规则、
+ * 出站和流量，随轮询批量回传。面板只保留最近的记录（单行 JSON，写入次数与流量无关）和当天的汇总，仅管理员可见。
  */
 
 const OPTIONS_KEY = 'singbox_route_options';
 const DESIRED_KEY = 'singbox_route_desired';
 const STATE_KEY = 'singbox_route_state';
+const CONN_KEY = 'singbox_conn_log';
+export const MAX_CONN_RECORDS = 1000;
+export const MAX_CONN_BODY = 1024 * 1024;
+const MAX_ACTIVE = 200;
+const MAX_HOSTS = 500;
+const KEEP_HOSTS = 300;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 export const MAX_ROUTE_BYTES = 256 * 1024;
 export const MAX_REPORT_BYTES = 512 * 1024;
 const MAX_EVENTS = 20;
@@ -44,7 +54,17 @@ async function saveJson(db, key, value) {
 
 export async function loadSingboxOptions(db) {
   const options = await loadJson(db, OPTIONS_KEY, {});
-  return { server_id: isValidServerId(options.server_id) ? options.server_id : '' };
+  return {
+    server_id: isValidServerId(options.server_id) ? options.server_id : '',
+    // 连接分流记录默认开启
+    conn_log: options.conn_log !== false
+  };
+}
+
+// 开关连接分流记录；关闭时脚本停止采集（Clash API 配置保留，只监听本机）
+export async function setSingboxConnLog(env, enabled) {
+  const options = await loadSingboxOptions(env.DB);
+  await saveJson(env.DB, OPTIONS_KEY, { ...options, conn_log: Boolean(enabled) });
 }
 
 export async function loadSingboxDesired(db) {
@@ -63,9 +83,9 @@ export async function setSingboxServer(env, serverId) {
   const next = serverId === null || serverId === undefined ? '' : String(serverId);
   if (next && !isValidServerId(next)) throw new Error('invalidServerId');
   if (next !== options.server_id) {
-    await saveJson(env.DB, OPTIONS_KEY, { server_id: next });
+    await saveJson(env.DB, OPTIONS_KEY, { ...options, server_id: next });
     await saveJson(env.DB, STATE_KEY, { events: [] });
-    await env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(DESIRED_KEY).run();
+    await env.DB.prepare('DELETE FROM settings WHERE key IN (?, ?)').bind(DESIRED_KEY, CONN_KEY).run();
   }
 }
 
@@ -166,8 +186,9 @@ export async function pollSingboxRoute(env, serverId, appliedRev, now = Date.now
     state.seen_at = now;
     await saveJson(env.DB, STATE_KEY, state);
   }
-  if (!desired || desired.rev === String(appliedRev || '').trim()) return { status: 204 };
-  return { status: 200, rev: desired.rev, route: desired.route };
+  const connLog = options.conn_log;
+  if (!desired || desired.rev === String(appliedRev || '').trim()) return { status: 204, connLog };
+  return { status: 200, rev: desired.rev, route: desired.route, connLog };
 }
 
 function cleanText(value, max = MAX_MESSAGE_LENGTH) {
@@ -273,5 +294,162 @@ export async function buildSingboxAdminView(env) {
       current_hash: state.current_hash || '',
       events: state.events || []
     }
+  };
+}
+
+// ---------------- 连接分流记录 ----------------
+
+export async function loadConnLog(db) {
+  const log = await loadJson(db, CONN_KEY, {});
+  return {
+    records: Array.isArray(log.records) ? log.records : [],
+    active: Array.isArray(log.active) ? log.active : [],
+    totals: log.totals && typeof log.totals === 'object' ? log.totals : null,
+    stats: log.stats && typeof log.stats === 'object' ? log.stats : null,
+    updated_at: log.updated_at || null
+  };
+}
+
+function beijingDate(now) {
+  return new Date(now + BEIJING_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+function toCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function toTime(value, fallback) {
+  const t = typeof value === 'number' ? value : Date.parse(String(value || ''));
+  return Number.isFinite(t) && t > 0 ? t : fallback;
+}
+
+// Clash API 的 rule 形如 "domain_suffix=netflix.com => route(warp)"，未命中规则时为 "final"
+export function cleanConnRecord(raw, now) {
+  if (!isPlainObject(raw)) return null;
+  const chain = Array.isArray(raw.chain)
+    ? raw.chain.filter(tag => typeof tag === 'string').slice(0, 8).map(tag => cleanText(tag, 128))
+    : [];
+  const end = toTime(raw.end, now);
+  const record = {
+    start: toTime(raw.start, end),
+    end,
+    in: cleanText(raw.in, 128),
+    net: cleanText(raw.net, 8),
+    src: cleanText(raw.src, 64),
+    host: cleanText(raw.host, 253),
+    ip: cleanText(raw.ip, 64),
+    port: cleanText(raw.port, 8),
+    rule: cleanText(raw.rule, 300),
+    out: chain[0] || '',
+    chain,
+    up: toCount(raw.up),
+    down: toCount(raw.down)
+  };
+  if (!record.host && !record.ip) return null;
+  return record;
+}
+
+function addStat(map, key, record, extra = {}) {
+  const item = map[key] || { count: 0, up: 0, down: 0 };
+  item.count += 1;
+  item.up += record.up;
+  item.down += record.down;
+  Object.assign(item, extra);
+  map[key] = item;
+}
+
+// 当天（北京时间）按出站与目标汇总；目标过多时只保留连接数最多的一部分
+function updateConnStats(stats, records, now) {
+  const date = beijingDate(now);
+  const next = stats?.date === date ? stats : { date, count: 0, up: 0, down: 0, outbounds: {}, hosts: {} };
+  for (const record of records) {
+    next.count += 1;
+    next.up += record.up;
+    next.down += record.down;
+    addStat(next.outbounds, record.out || '-', record);
+    addStat(next.hosts, record.host || record.ip, record, { out: record.out });
+  }
+  const hostKeys = Object.keys(next.hosts);
+  if (hostKeys.length > MAX_HOSTS) {
+    const keep = hostKeys.sort((a, b) => next.hosts[b].count - next.hosts[a].count).slice(0, KEEP_HOSTS);
+    next.hosts = Object.fromEntries(keep.map(key => [key, next.hosts[key]]));
+  }
+  return next;
+}
+
+/**
+ * 服务器回传连接记录：{ closed: [已结束的连接], active: [当前连接], totals: { up, down } }
+ * 调用方需先校验该服务器的上报密钥
+ */
+export async function reportSingboxConns(env, serverId, bodyText, now = Date.now()) {
+  const options = await loadSingboxOptions(env.DB);
+  if (!options.server_id || options.server_id !== serverId) return { status: 403, error: 'not_selected' };
+  if (!options.conn_log) return { status: 200, ok: true, ignored: true };
+  if (String(bodyText || '').length > MAX_CONN_BODY) return { status: 413, error: 'too_large' };
+
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch (_) {
+    return { status: 400, error: 'invalid_json' };
+  }
+  if (!isPlainObject(body)) return { status: 400, error: 'invalid_json' };
+
+  const closed = (Array.isArray(body.closed) ? body.closed.slice(-MAX_CONN_RECORDS) : [])
+    .map(item => cleanConnRecord(item, now))
+    .filter(Boolean)
+    .sort((a, b) => b.end - a.end);
+  const active = (Array.isArray(body.active) ? body.active.slice(0, MAX_ACTIVE) : [])
+    .map(item => cleanConnRecord(item, now))
+    .filter(Boolean)
+    .sort((a, b) => b.start - a.start);
+
+  const log = await loadConnLog(env.DB);
+  log.records = [...closed, ...log.records].slice(0, MAX_CONN_RECORDS);
+  log.active = active;
+  if (isPlainObject(body.totals)) log.totals = { up: toCount(body.totals.up), down: toCount(body.totals.down) };
+  log.stats = updateConnStats(log.stats, closed, now);
+  log.updated_at = now;
+  await saveJson(env.DB, CONN_KEY, log);
+  return { status: 200, ok: true, saved: closed.length };
+}
+
+export async function clearSingboxConns(env) {
+  await env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(CONN_KEY).run();
+}
+
+// 首页（仅管理员）展示的连接分流记录
+export async function buildSingboxConnView(env, now = Date.now()) {
+  const options = await loadSingboxOptions(env.DB);
+  if (!options.server_id) return { enabled: false };
+  const [log, server] = await Promise.all([
+    loadConnLog(env.DB),
+    env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(options.server_id).first().catch(() => null)
+  ]);
+  const stats = log.stats?.date === beijingDate(now) ? log.stats : null;
+  return {
+    enabled: true,
+    recording: options.conn_log,
+    server: { id: options.server_id, name: server?.name || options.server_id },
+    updated_at: log.updated_at,
+    totals: log.totals,
+    active: log.active,
+    records: log.records,
+    stats: stats
+      ? {
+        date: stats.date,
+        count: stats.count,
+        up: stats.up,
+        down: stats.down,
+        outbounds: Object.entries(stats.outbounds)
+          .map(([tag, item]) => ({ tag, ...item }))
+          .sort((a, b) => b.count - a.count),
+        hosts: Object.entries(stats.hosts)
+          .map(([host, item]) => ({ host, ...item }))
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 100)
+      }
+      : null
   };
 }

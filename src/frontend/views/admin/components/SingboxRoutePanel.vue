@@ -26,6 +26,15 @@
         </div>
         <div v-if="view?.sync === 'drift'" class="warning-box sb-gap text-sm">{{ trans.singboxDriftHint }}</div>
 
+        <div class="sb-connlog">
+          <label class="sb-check">
+            <input type="checkbox" :checked="view?.config?.conn_log !== false" :disabled="busy" @change="setConnLog($event.target.checked)" />
+            {{ trans.singboxConnLog }}
+          </label>
+          <button class="btn btn-sm" :disabled="busy" @click="clearConns">{{ trans.singboxConnClear }}</button>
+          <p class="text-muted text-sm">{{ trans.singboxConnLogHint }}</p>
+        </div>
+
         <details class="sb-install" :open="!state.seen_at">
           <summary>{{ trans.singboxInstall }}</summary>
           <div class="relay-command">
@@ -404,6 +413,27 @@ const saveServer = async () => {
   }
 }
 
+const setConnLog = async (enabled) => {
+  busy.value = true
+  try {
+    const data = await call({ action: 'singbox_set_conn_log', enabled })
+    if (data) applyView(data)
+  } finally {
+    busy.value = false
+  }
+}
+
+const clearConns = async () => {
+  if (!window.confirm(props.trans.singboxConnClearConfirm)) return
+  busy.value = true
+  try {
+    const data = await call({ action: 'singbox_clear_conns' })
+    if (data) applyView(data)
+  } finally {
+    busy.value = false
+  }
+}
+
 const saveRoute = async () => {
   let route
   try {
@@ -495,6 +525,26 @@ onUnmounted(() => clearTimeout(pollTimer))
 
 .sb-install {
   margin-top: 12px;
+}
+
+.sb-connlog {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+
+.sb-connlog p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.sb-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
 }
 
 .sb-install summary {

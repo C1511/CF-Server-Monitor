@@ -4,7 +4,12 @@ import { DatabaseSync } from 'node:sqlite';
 
 import {
   buildSingboxAdminView,
+  buildSingboxConnView,
   canonicalJson,
+  clearSingboxConns,
+  MAX_CONN_RECORDS,
+  reportSingboxConns,
+  setSingboxConnLog,
   pollSingboxRoute,
   reportSingbox,
   saveSingboxRoute,
@@ -22,6 +27,8 @@ import {
 function createD1() {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+  db.exec('CREATE TABLE servers (id TEXT PRIMARY KEY, name TEXT)');
+  db.exec("INSERT INTO servers VALUES ('srv-hk', '阿里云香港')");
   const statement = (sql, params = []) => ({
     bind: (...args) => statement(sql, args),
     first: async () => db.prepare(sql).get(...params) ?? null,
@@ -194,4 +201,65 @@ test('editor: invalid rows report their index', () => {
   assert.throws(() => rowToRule({ type: 'json', json: '{bad' }), e => e.code === 'singboxRowInvalidJson');
   assert.throws(() => rowToRule({ type: 'geosite', values: 'a b', action: 'out:direct' }), e => e.code === 'singboxRowInvalidName');
   assert.throws(() => rowToRule({ type: 'any', values: '', action: '' }), e => e.code === 'singboxRowNoAction');
+});
+
+function conn(host, out, extra = {}) {
+  return {
+    start: '2026-10-03T00:00:00Z', end: '2026-10-03T00:00:05Z',
+    in: 'anytls/anytls-in', net: 'tcp', src: '1.2.3.4', host, ip: '', port: '443',
+    rule: out === 'direct' ? 'final' : `domain_suffix=${host} => route(${out})`,
+    chain: [out], up: 100, down: 2000, ...extra
+  };
+}
+
+test('connection log: records, active list and daily summary per outbound / host', async () => {
+  const env = await singboxEnv();
+  assert.equal((await reportSingboxConns(env, 'other', '{}', T0)).status, 403);
+  assert.equal((await reportSingboxConns(env, 'srv-hk', 'nope', T0)).status, 400);
+
+  const body = {
+    closed: [conn('netflix.com', 'warp'), conn('netflix.com', 'warp'), conn('example.com', 'direct'), { host: '' }],
+    active: [conn('openai.com', 'warp', { end: undefined })],
+    totals: { up: 5000, down: 90000 }
+  };
+  assert.equal((await reportSingboxConns(env, 'srv-hk', JSON.stringify(body), T0)).saved, 3, 'invalid record dropped');
+  const view = await buildSingboxConnView(env, T0);
+  assert.equal(view.enabled, true);
+  assert.equal(view.server.name, '阿里云香港');
+  assert.equal(view.records.length, 3);
+  assert.equal(view.records[0].out, view.records[0].chain[0]);
+  assert.equal(view.active[0].host, 'openai.com');
+  assert.deepEqual(view.totals, { up: 5000, down: 90000 });
+  assert.equal(view.stats.count, 3);
+  assert.deepEqual(view.stats.outbounds.map(o => [o.tag, o.count]), [['warp', 2], ['direct', 1]]);
+  assert.deepEqual(view.stats.hosts[0], { host: 'netflix.com', count: 2, up: 200, down: 4000, out: 'warp' });
+
+  // 第二天汇总重新计数，记录保留
+  const nextDay = T0 + 24 * 3600 * 1000;
+  await reportSingboxConns(env, 'srv-hk', JSON.stringify({ closed: [conn('a.com', 'warp')], active: [] }), nextDay);
+  const later = await buildSingboxConnView(env, nextDay);
+  assert.equal(later.stats.count, 1);
+  assert.equal(later.records.length, 4);
+
+  await clearSingboxConns(env);
+  assert.equal((await buildSingboxConnView(env, nextDay)).records.length, 0);
+});
+
+test('connection log: capped, can be turned off, and dropped when switching servers', async () => {
+  const env = await singboxEnv();
+  const many = Array.from({ length: MAX_CONN_RECORDS + 50 }, (_, i) => conn(`h${i}.com`, 'warp'));
+  await reportSingboxConns(env, 'srv-hk', JSON.stringify({ closed: many }), T0);
+  assert.equal((await buildSingboxConnView(env, T0)).records.length, MAX_CONN_RECORDS);
+
+  assert.equal((await pollSingboxRoute(env, 'srv-hk', '', T0)).connLog, true, 'on by default');
+  await setSingboxConnLog(env, false);
+  assert.equal((await pollSingboxRoute(env, 'srv-hk', '', T0)).connLog, false);
+  assert.equal((await reportSingboxConns(env, 'srv-hk', JSON.stringify({ closed: [conn('x.com', 'warp')] }), T0)).ignored, true);
+  assert.equal((await buildSingboxConnView(env, T0)).recording, false);
+
+  await setSingboxServer(env, 'srv-jp');
+  assert.equal((await pollSingboxRoute(env, 'srv-jp', '', T0)).connLog, false, 'switch keeps the setting');
+  assert.equal((await buildSingboxConnView(env, T0)).records.length, 0, 'old server records dropped');
+  await setSingboxServer(env, null);
+  assert.equal((await buildSingboxConnView(env, T0)).enabled, false);
 });

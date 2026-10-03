@@ -21,6 +21,10 @@
 #   cfsm-singbox update      从面板更新本脚本
 #   cfsm-singbox uninstall   卸载（不会改动 sing-box 配置）
 #   cfsm-singbox ensure      同步进程未运行时启动它（无服务管理器时由 crontab 每分钟调用）
+#
+# 连接分流记录（面板中可关闭）：通过本机 sing-box 的 Clash API 每秒采集一次连接快照，
+# 连接结束时记下目标、命中规则、出站和流量，随轮询回传面板。配置中没有 clash_api 时会自动添加，
+# 只监听 127.0.0.1 并使用随机密钥；持续时间不足 1 秒的连接可能采集不到。
 
 set -u
 umask 077
@@ -37,6 +41,13 @@ UNIT_FILE="/etc/systemd/system/$UNIT_NAME.service"
 OPENRC_FILE="/etc/init.d/$UNIT_NAME"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 SB_LOG="$STATE_DIR/sing-box.log"
+CONN_PREV="$STATE_DIR/conn.prev.json"
+CONN_CLOSED="$STATE_DIR/conn.closed.jsonl"
+# 本地最多缓存的已结束连接条数（面板长时间连不上时丢弃最旧的）
+CONN_BUFFER_MAX=3000
+# 当前连接没有变化时，最长多久回传一次（秒）
+CONN_ACTIVE_REFRESH=60
+CLASH_DEFAULT_LISTEN="127.0.0.1:19095"
 CRON_TAG="# cfsm-singbox"
 # 即使配置没有变化，也定期回传一次（秒）
 RESYNC_SECONDS=3600
@@ -144,24 +155,31 @@ singbox_version() {
 
 # 生成回传给面板的 JSON；入站/出站只取 tag 与类型（endpoints 也可作为出站）
 # 其他配置文件（-C 目录）中的出站一并收集
-build_report() {
-    rp_event="$1"; rp_rev="$2"; rp_ok="$3"; rp_msg="$4"; rp_out="$5"
-    # 按绝对路径去重（启动参数里可能是相对路径）
-    rp_main="$(readlink -f "$SB_CONFIG" 2>/dev/null || printf '%s' "$SB_CONFIG")"
-    rp_files="$rp_main"
+# sing-box 用到的全部配置文件（含 route 的文件在最前），按绝对路径去重（启动参数里可能是相对路径）
+config_files() {
+    cf_list="$(readlink -f "$SB_CONFIG" 2>/dev/null || printf '%s' "$SB_CONFIG")"
     for f in $(printf '%s\n' "$CHECK_ARGS" | awk '{for (i = 1; i < NF; i++) if ($i == "-c" || $i == "--config") print $(i + 1)}'); do
-        [ -f "$f" ] && rp_files="$rp_files $(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+        [ -f "$f" ] && cf_list="$cf_list $(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
     done
     for arg_dir in $(printf '%s\n' "$CHECK_ARGS" | awk '{for (i = 1; i < NF; i++) if ($i == "-C" || $i == "--config-directory") print $(i + 1)}'); do
         for f in "$arg_dir"/*.json; do
-            [ -f "$f" ] && rp_files="$rp_files $(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+            [ -f "$f" ] && cf_list="$cf_list $(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
         done
     done
-    rp_files="$(printf '%s\n' $rp_files | awk '!seen[$0]++')"
-    rp_tmp="$(mktemp "${TMPDIR:-/tmp}/cfsm-sb-report.XXXXXX")" || return 1
-    for f in $rp_files; do
+    printf '%s\n' $cf_list | awk '!seen[$0]++'
+}
+
+# 输出所有配置文件的 JSON（每个文件一个对象，含注释的先用 sing-box format 转换）
+all_config_json() {
+    for f in $(config_files); do
         if jq -e 'type == "object"' "$f" >/dev/null 2>&1; then cat "$f"; else "$SB_BIN" format -c "$f" 2>/dev/null; fi
-    done | jq -s '{
+    done
+}
+
+build_report() {
+    rp_event="$1"; rp_rev="$2"; rp_ok="$3"; rp_msg="$4"; rp_out="$5"
+    rp_tmp="$(mktemp "${TMPDIR:-/tmp}/cfsm-sb-report.XXXXXX")" || return 1
+    all_config_json | jq -s '{
         inbounds: [.[] | .inbounds[]? | {tag: (.tag // ""), type: (.type // "")}],
         outbounds: [.[] | (.outbounds[]?, .endpoints[]?) | {tag: (.tag // ""), type: (.type // "")}],
         route: ([.[] | .route? | select(. != null)] | first)
@@ -299,7 +317,6 @@ apply_route() {
     ar_rev="$1"
     ar_route="$2"
     ar_new="$(mktemp "${TMPDIR:-/tmp}/cfsm-sb-new.XXXXXX")" || return 1
-    ar_backup="$STATE_DIR/config.backup.json"
 
     if ! jq -e 'type == "object"' "$ar_route" >/dev/null 2>&1; then
         AR_MESSAGE="面板下发的 route 不是 JSON 对象"
@@ -311,7 +328,13 @@ apply_route() {
         rm -f "$ar_new"
         return 1
     fi
+    install_config "$ar_new"
+}
 
+# 用新文件替换配置：备份 -> 写入 -> check -> 重启 -> 观察，任一步失败都恢复备份；结果写入 AR_MESSAGE
+install_config() {
+    ar_new="$1"
+    ar_backup="$STATE_DIR/config.backup.json"
     cp -p "$SB_CONFIG" "$ar_backup" || { AR_MESSAGE="备份配置失败"; rm -f "$ar_new"; return 1; }
     # 原地写入以保留文件权限与属主；sing-box 只在启动时读取配置，check 失败会立即恢复
     cat "$ar_new" > "$SB_CONFIG"
@@ -340,6 +363,141 @@ apply_route() {
         AR_MESSAGE="新配置启动失败，回滚后 sing-box 仍未正常运行，请登录服务器检查！${logs:+ 日志：$logs}"
     fi
     return 1
+}
+
+# ---------------- 连接分流记录 ----------------
+
+# Clash API 连接 -> 回传面板的记录
+CONN_REC_DEF='def rec($end): {
+    start: .start, end: $end,
+    in: (.metadata.type // ""), net: (.metadata.network // ""), src: (.metadata.sourceIP // ""),
+    host: (.metadata.host // ""), ip: (.metadata.destinationIP // ""), port: (.metadata.destinationPort // ""),
+    rule: (.rule // ""), chain: (.chains // []), up: (.upload // 0), down: (.download // 0)
+};'
+
+utc_now() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# 从配置中找出 Clash API 地址与密钥（监听全部地址时改用 127.0.0.1 访问）
+detect_clash() {
+    dc_tmp="$(all_config_json | jq -rs '[.[] | .experimental.clash_api? | select(. != null and (.external_controller // "") != "")] | first // empty | .external_controller, (.secret // "")' 2>/dev/null)"
+    dc_listen="$(printf '%s\n' "$dc_tmp" | sed -n 1p)"
+    if [ -z "$dc_listen" ]; then
+        state_set clash_url ""
+        state_set clash_secret ""
+        return 1
+    fi
+    dc_port="${dc_listen##*:}"
+    dc_host="${dc_listen%:*}"
+    case "$dc_host" in
+        ""|0.0.0.0|"[::]"|::|localhost) dc_host="127.0.0.1" ;;
+    esac
+    state_set clash_url "http://$dc_host:$dc_port"
+    state_set clash_secret "$(printf '%s\n' "$dc_tmp" | sed -n 2p)"
+    return 0
+}
+
+# 配置里没有 Clash API 时添加一个只监听本机、带随机密钥的（同样经过 check / 重启 / 回滚）
+enable_clash_api() {
+    ec_secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    ec_new="$(mktemp "${TMPDIR:-/tmp}/cfsm-sb-new.XXXXXX")" || return 1
+    if ! read_config_json | jq --arg l "$CLASH_DEFAULT_LISTEN" --arg s "$ec_secret" \
+        '.experimental.clash_api = ((.experimental.clash_api // {}) + {external_controller: $l, secret: $s})' > "$ec_new" 2>/dev/null || [ ! -s "$ec_new" ]; then
+        rm -f "$ec_new"
+        return 1
+    fi
+    log "为记录连接分流开启 Clash API（$CLASH_DEFAULT_LISTEN，仅本机）"
+    AR_MESSAGE=""
+    if install_config "$ec_new"; then
+        detect_clash
+        state_set clash_sum "$(config_sum)"
+        log "Clash API 已开启"
+        send_report sync "" true "已开启 Clash API（$CLASH_DEFAULT_LISTEN，仅本机）用于记录连接分流" || true
+    else
+        # 同一份配置不再重试，避免反复重启 sing-box
+        state_set clash_failed "$(config_sum)"
+        log "[ERROR] 开启 Clash API 失败：$AR_MESSAGE"
+        send_report sync "" false "开启 Clash API 失败，无法记录连接分流：$AR_MESSAGE" || true
+    fi
+}
+
+# 采集一次连接快照：上次有、这次没有的连接视为已结束，按上次的流量记录下来
+collect_conns() {
+    cc_url="$(state_get clash_url)"
+    [ -n "$cc_url" ] || return 0
+    cc_secret="$(state_get clash_secret)"
+    cc_cur="$STATE_DIR/conn.cur.json"
+    {
+        printf 'url = "%s/connections"\n' "$cc_url"
+        [ -n "$cc_secret" ] && printf 'header = "Authorization: Bearer %s"\n' "$cc_secret"
+    } | curl -s -m 3 --noproxy '*' -K - -o "$cc_cur" 2>/dev/null || return 0
+    jq -e '.connections | type == "array"' "$cc_cur" >/dev/null 2>&1 || { rm -f "$cc_cur"; return 0; }
+    if [ -f "$CONN_PREV" ]; then
+        jq -c --slurpfile cur "$cc_cur" --arg now "$(utc_now)" "$CONN_REC_DEF"'
+            (($cur[0].connections // []) | map({(.id): true}) | add // {}) as $seen
+            | (.connections // [])[] | select($seen[.id] | not) | rec($now)' "$CONN_PREV" >> "$CONN_CLOSED" 2>/dev/null
+    fi
+    mv "$cc_cur" "$CONN_PREV"
+}
+
+# 回传连接记录：有新结束的连接、当前连接有变化，或距上次超过 CONN_ACTIVE_REFRESH 秒时才发送
+upload_conns() {
+    [ -n "$(state_get clash_url)" ] && [ -f "$CONN_PREV" ] || return 0
+    uc_sending="$CONN_CLOSED.sending"
+    if [ -s "$CONN_CLOSED" ]; then
+        cat "$CONN_CLOSED" >> "$uc_sending"
+        rm -f "$CONN_CLOSED"
+    fi
+    if [ -f "$uc_sending" ] && [ "$(wc -l < "$uc_sending")" -gt "$CONN_BUFFER_MAX" ]; then
+        tail -n "$CONN_BUFFER_MAX" "$uc_sending" > "$uc_sending.tmp" && mv "$uc_sending.tmp" "$uc_sending"
+    fi
+    uc_sig="$(jq -r '[.connections[]?.id] | sort | join(",")' "$CONN_PREV" 2>/dev/null | cksum | awk '{print $1}')"
+    uc_now="$(date +%s)"
+    uc_last="$(state_get conn_uploaded_at)"
+    if [ ! -s "$uc_sending" ] && [ "$uc_sig" = "$(state_get conn_sig)" ] && [ $((uc_now - ${uc_last:-0})) -lt "$CONN_ACTIVE_REFRESH" ]; then
+        return 0
+    fi
+    [ -f "$uc_sending" ] || : > "$uc_sending"
+    uc_body="$(mktemp "${TMPDIR:-/tmp}/cfsm-sb-conn.XXXXXX")" || return 1
+    if ! jq -n --slurpfile closed "$uc_sending" --slurpfile cur "$CONN_PREV" --arg now "$(utc_now)" "$CONN_REC_DEF"'
+        {
+            closed: $closed,
+            active: ([($cur[0].connections // [])[] | rec($now)] | sort_by(.start) | reverse | .[:200]),
+            totals: {up: ($cur[0].uploadTotal // 0), down: ($cur[0].downloadTotal // 0)}
+        }' > "$uc_body" 2>/dev/null; then
+        # 缓存损坏：丢弃，避免一直发送失败
+        rm -f "$uc_body" "$uc_sending"
+        return 1
+    fi
+    uc_code="$(panel_request /relay/singbox/conns "$uc_body.resp" "$uc_body")" || uc_code="000"
+    rm -f "$uc_body" "$uc_body.resp" "$uc_body.resp.hdr"
+    if [ "$uc_code" = "200" ]; then
+        rm -f "$uc_sending"
+        state_set conn_sig "$uc_sig"
+        state_set conn_uploaded_at "$uc_now"
+    else
+        log "[WARN] 回传连接记录失败：HTTP $uc_code"
+    fi
+}
+
+# 根据面板的开关准备采集：找到或开启 Clash API；关闭时清掉本地缓存
+sync_conn_log() {
+    if [ "$1" != "1" ]; then
+        state_set conn_log 0
+        rm -f "$CONN_PREV" "$CONN_CLOSED" "$CONN_CLOSED.sending"
+        return 0
+    fi
+    state_set conn_log 1
+    cs_sum="$(config_sum)"
+    if [ "$cs_sum" != "$(state_get clash_sum)" ]; then
+        detect_clash
+        state_set clash_sum "$cs_sum"
+    fi
+    if [ -z "$(state_get clash_url)" ] && [ "$(state_get clash_failed)" != "$cs_sum" ]; then
+        enable_clash_api
+    fi
+    upload_conns
 }
 
 cmd_sync() {
@@ -391,6 +549,13 @@ cmd_sync() {
         403) log "[WARN] 面板未选择本机为 sing-box 服务器" ;;
         *) log "[WARN] 无法连接面板 $PANEL_URL（HTTP $code）" ;;
     esac
+    case "$code" in
+        200|204)
+            # 面板通过 X-Conn-Log 告知是否记录连接分流（旧版面板没有该响应头，视为关闭）
+            conn_flag="$(sed -n 's/^[Xx]-[Cc]onn-[Ll]og:[[:space:]]*//p' "$tmp.hdr" | tr -d '\r' | head -n 1)"
+            sync_conn_log "$conn_flag"
+            ;;
+    esac
     rm -f "$tmp" "$tmp.hdr"
     rmdir "$LOCK_DIR" 2>/dev/null
     trim_log
@@ -400,9 +565,17 @@ cmd_daemon() {
     load_config
     printf '%s' "$$" > "$DAEMON_PID"
     log "已启动，每 ${INTERVAL} 秒轮询一次 $PANEL_URL"
+    # 每秒一轮：开启连接分流记录时采集一次连接快照；每 INTERVAL 秒与面板同步一次
+    last_sync=0
     while :; do
-        ( cmd_sync ) || true
-        sleep "$INTERVAL"
+        if [ $(($(date +%s) - last_sync)) -ge "$INTERVAL" ]; then
+            ( cmd_sync ) || true
+            last_sync="$(date +%s)"
+        fi
+        if [ "$(state_get conn_log)" = "1" ]; then
+            ( collect_conns ) || true
+        fi
+        sleep 1
     done
 }
 
